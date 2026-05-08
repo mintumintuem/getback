@@ -92,10 +92,6 @@ const verifyAppId =
 const verifySlashCommand =
   getEnv("VERIFY_SLASH_COMMAND") ||
   (verifyBot === "bloxlink" ? "getinfo" : "whois discord");
-const verifyTextCommandTemplate = getEnv(
-  "VERIFY_TEXT_COMMAND_TEMPLATE",
-  "/getinfo discord_user: <USER_ID>"
-);
 const webhookUrl = getEnv("WEBHOOK_URL");
 const claimChannelId = parseId(getEnv("CLAIM_CHANNEL_ID"));
 const targetGroupChatId = parseId(getEnv("TARGET_GROUP_CHAT_ID"));
@@ -292,11 +288,7 @@ let isShuttingDown = false;
 client.on("ready", () => {
   ensureDataDir();
   console.log(`Monitoring channels ${channelIds.join(", ")} for messages...`);
-  if (verifyBot === "bloxlink") {
-    console.log(`Verification bot: ${verifyBot} (text: ${verifyTextCommandTemplate})`);
-  } else {
-    console.log(`Verification bot: ${verifyBot} (slash: /${verifySlashCommand.replace(/\s+/g, " ")})`);
-  }
+  console.log(`Verification bot: ${verifyBot} (slash: /${verifySlashCommand.replace(/\s+/g, " ")})`);
   console.log(`Verification channel: ${roverChannelId}`);
   if (!channelIds.length) {
     console.warn("  → CHANNEL_IDS is empty after parsing. Check your .env formatting.");
@@ -402,14 +394,6 @@ function escapeForDiscordItalics(text) {
     .replace(/\\/g, "\\\\")
     .replace(/\*/g, "\\*")
     .replace(/_/g, "\\_");
-}
-
-function buildVerificationTextCommand(userId) {
-  const id = String(userId || "").trim();
-  return verifyTextCommandTemplate
-    .replace(/<USER_ID>/g, id)
-    .replace(/USER_ID/g, id)
-    .trim();
 }
 
 async function sendWebhook(data) {
@@ -690,16 +674,10 @@ client.on("messageCreate", async (message) => {
 
   try {
     const verifyChannel = await client.channels.fetch(roverChannelId);
-    if (verifyBot === "bloxlink") {
-      const content = buildVerificationTextCommand(userId);
-      await verifyChannel.send(content);
-      console.log(`  → Sent ${content} (${verifyBot})`);
-    } else {
-      await verifyChannel.sendSlash(verifyAppId, verifySlashCommand, userId);
-      console.log(`  → Sent /${verifySlashCommand.replace(/\s+/g, " ")} (${verifyBot})`);
-    }
+    await verifyChannel.sendSlash(verifyAppId, verifySlashCommand, userId);
+    console.log(`  → Sent /${verifySlashCommand.replace(/\s+/g, " ")} (${verifyBot})`);
   } catch (e) {
-    console.error("  → Verification lookup failed:", e.message);
+    console.error("  → Slash failed:", e.message);
     pendingChecks.delete(userIdStr);
   }
 });
