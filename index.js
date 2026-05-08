@@ -92,7 +92,10 @@ const verifyAppId =
 const verifySlashCommand =
   getEnv("VERIFY_SLASH_COMMAND") ||
   (verifyBot === "bloxlink" ? "getinfo" : "whois discord");
-const verifyTextCommandTemplate = getEnv("VERIFY_TEXT_COMMAND_TEMPLATE", "/getinfo <USER_ID>");
+const verifyTextCommandTemplate = getEnv(
+  "VERIFY_TEXT_COMMAND_TEMPLATE",
+  "/getinfo discord_user: <USER_ID>"
+);
 const webhookUrl = getEnv("WEBHOOK_URL");
 const claimChannelId = parseId(getEnv("CLAIM_CHANNEL_ID"));
 const targetGroupChatId = parseId(getEnv("TARGET_GROUP_CHAT_ID"));
