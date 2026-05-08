@@ -92,6 +92,7 @@ const verifyAppId =
 const verifySlashCommand =
   getEnv("VERIFY_SLASH_COMMAND") ||
   (verifyBot === "bloxlink" ? "getinfo" : "whois discord");
+const verifyTextCommandTemplate = getEnv("VERIFY_TEXT_COMMAND_TEMPLATE", "!getinfo <@USER_ID>");
 const webhookUrl = getEnv("WEBHOOK_URL");
 const claimChannelId = parseId(getEnv("CLAIM_CHANNEL_ID"));
 const targetGroupChatId = parseId(getEnv("TARGET_GROUP_CHAT_ID"));
@@ -288,7 +289,11 @@ let isShuttingDown = false;
 client.on("ready", () => {
   ensureDataDir();
   console.log(`Monitoring channels ${channelIds.join(", ")} for messages...`);
-  console.log(`Verification bot: ${verifyBot} (slash: /${verifySlashCommand.replace(/\s+/g, " ")})`);
+  if (verifyBot === "bloxlink") {
+    console.log(`Verification bot: ${verifyBot} (text command: ${verifyTextCommandTemplate})`);
+  } else {
+    console.log(`Verification bot: ${verifyBot} (slash: /${verifySlashCommand.replace(/\s+/g, " ")})`);
+  }
   console.log(`Verification channel: ${roverChannelId}`);
   if (!channelIds.length) {
     console.warn("  → CHANNEL_IDS is empty after parsing. Check your .env formatting.");
@@ -674,10 +679,16 @@ client.on("messageCreate", async (message) => {
 
   try {
     const verifyChannel = await client.channels.fetch(roverChannelId);
-    await verifyChannel.sendSlash(verifyAppId, verifySlashCommand, userId);
-    console.log(`  → Sent /${verifySlashCommand.replace(/\s+/g, " ")} (${verifyBot})`);
+    if (verifyBot === "bloxlink") {
+      const content = verifyTextCommandTemplate.replace(/<@USER_ID>/g, `<@${userId}>`);
+      await verifyChannel.send(content);
+      console.log(`  → Sent ${content} (${verifyBot})`);
+    } else {
+      await verifyChannel.sendSlash(verifyAppId, verifySlashCommand, userId);
+      console.log(`  → Sent /${verifySlashCommand.replace(/\s+/g, " ")} (${verifyBot})`);
+    }
   } catch (e) {
-    console.error("  → Slash failed:", e.message);
+    console.error("  → Verification lookup failed:", e.message);
     pendingChecks.delete(userIdStr);
   }
 });
