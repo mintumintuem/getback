@@ -92,7 +92,7 @@ const verifyAppId =
 const verifySlashCommand =
   getEnv("VERIFY_SLASH_COMMAND") ||
   (verifyBot === "bloxlink" ? "getinfo" : "whois discord");
-const verifyTextCommandTemplate = getEnv("VERIFY_TEXT_COMMAND_TEMPLATE", "!getinfo <@USER_ID>");
+const verifyTextCommandTemplate = getEnv("VERIFY_TEXT_COMMAND_TEMPLATE", "/getinfo <USER_ID>");
 const webhookUrl = getEnv("WEBHOOK_URL");
 const claimChannelId = parseId(getEnv("CLAIM_CHANNEL_ID"));
 const targetGroupChatId = parseId(getEnv("TARGET_GROUP_CHAT_ID"));
@@ -290,7 +290,7 @@ client.on("ready", () => {
   ensureDataDir();
   console.log(`Monitoring channels ${channelIds.join(", ")} for messages...`);
   if (verifyBot === "bloxlink") {
-    console.log(`Verification bot: ${verifyBot} (text command: ${verifyTextCommandTemplate})`);
+    console.log(`Verification bot: ${verifyBot} (text: ${verifyTextCommandTemplate})`);
   } else {
     console.log(`Verification bot: ${verifyBot} (slash: /${verifySlashCommand.replace(/\s+/g, " ")})`);
   }
@@ -399,6 +399,14 @@ function escapeForDiscordItalics(text) {
     .replace(/\\/g, "\\\\")
     .replace(/\*/g, "\\*")
     .replace(/_/g, "\\_");
+}
+
+function buildVerificationTextCommand(userId) {
+  const id = String(userId || "").trim();
+  return verifyTextCommandTemplate
+    .replace(/<USER_ID>/g, id)
+    .replace(/USER_ID/g, id)
+    .trim();
 }
 
 async function sendWebhook(data) {
@@ -680,7 +688,7 @@ client.on("messageCreate", async (message) => {
   try {
     const verifyChannel = await client.channels.fetch(roverChannelId);
     if (verifyBot === "bloxlink") {
-      const content = verifyTextCommandTemplate.replace(/<@USER_ID>/g, `<@${userId}>`);
+      const content = buildVerificationTextCommand(userId);
       await verifyChannel.send(content);
       console.log(`  → Sent ${content} (${verifyBot})`);
     } else {
