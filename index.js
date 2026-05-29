@@ -576,14 +576,19 @@ async function resolveSlashResponse(message, verifyChannel, { tries = 8, interva
   const id = message.id;
   if (!id || !verifyChannel) return message;
   // Bloxlink defers (LOADING, no embeds) then edits the embeds in. The messageUpdate
-  // event only delivers a partial (embeds=0), so re-fetch the message until it's populated.
+  // event only delivers a partial (embeds=0) and caches it, so force a fresh API fetch
+  // (bypassing cache) until the embeds are populated.
+  let lastFetchErr = null;
   for (let i = 0; i < tries; i++) {
     await sleep(intervalMs);
     try {
-      const fresh = await verifyChannel.messages.fetch(id);
+      const fresh = await verifyChannel.messages.fetch(id, { force: true });
       if (fresh && fresh.embeds && fresh.embeds.length) return fresh;
-    } catch (e) {}
+    } catch (e) {
+      lastFetchErr = e;
+    }
   }
+  if (lastFetchErr) console.log(`  → [resolve] fetch error for ${id}: ${lastFetchErr.message}`);
   return message;
 }
 
