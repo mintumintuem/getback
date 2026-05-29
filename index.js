@@ -240,6 +240,7 @@ async function bloxlinkDiscordToRoblox(discordUserId) {
         return { ok: false };
       }
       const data = await res.json().catch(() => null);
+      console.log(`  → [bloxlink raw] ${discordUserId}: ${JSON.stringify(data).slice(0, 400)}`);
       // Bloxlink sometimes returns 200 with { error: "...not linked..." }
       if (data && data.error && !data.robloxID) return { ok: true, notLinked: true };
       return parseBloxlinkResolve(data);
