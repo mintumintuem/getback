@@ -229,7 +229,8 @@ async function bloxlinkDiscordToRoblox(discordUserId, guildId) {
         return { ok: false };
       }
       if (!res.ok) {
-        console.warn(`  → Bloxlink API ${res.status} for ${discordUserId}`);
+        const body = await res.text().catch(() => "");
+        console.warn(`  → Bloxlink API ${res.status} for ${discordUserId} | body: ${String(body).slice(0, 200)}`);
         return { ok: false };
       }
       const data = await res.json().catch(() => null);
