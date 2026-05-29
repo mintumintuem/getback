@@ -267,7 +267,7 @@ const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const THIRTY_FIVE_DAYS_MS = 35 * 24 * 60 * 60 * 1000; // Keep ~1 month for novice filter
 const ONE_MINUTE_MS = 60 * 1000;
 const WEBHOOK_DEBOUNCE_MS = 90 * 1000; // Prevent duplicate webhooks for same user
-const MIN_RAP = 200000; // Minimum RAP to send webhook embed
+const MIN_RAP = 100000; // Minimum RAP to send webhook embed
 const MIN_RAP_WL = 150000; // For w/l messages: send only if N/A (privated) or above 150k
 const NOVICE_MAX_TOTAL_MESSAGES = 50; // Novices must have <50 messages to qualify (unless inactive 30+ days)
 const NOVICE_MAX_MESSAGES_IF_ACTIVE_2W = 5; // If active in past 2 weeks, max 3-5 messages in that period
@@ -446,12 +446,74 @@ function isUnlinkedVerificationEmbed(embed) {
   return phrases.some((p) => desc.includes(p) || title.includes(p) || blob.includes(p));
 }
 
+// Bloxlink /getinfo replies are EPHEMERAL (REST GET returns 404). The embeds only
+// arrive in the raw gateway MESSAGE_UPDATE/CREATE packet for the invoking account, and
+// discord.js-selfbot-v13's Message object drops them. We intercept the raw packet and
+// hand the embeds to whoever is awaiting that deferred message id.
+const slashWaiters = new Map(); // deferred messageId -> { resolve, timer }
+
+function registerSlashWaiter(messageId, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    const existing = slashWaiters.get(messageId);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(() => {
+      slashWaiters.delete(messageId);
+      resolve(null);
+    }, timeoutMs);
+    slashWaiters.set(messageId, { resolve, timer });
+  });
+}
+
+function deliverSlashEmbeds(messageId, embeds) {
+  const w = slashWaiters.get(messageId);
+  if (!w) return false;
+  clearTimeout(w.timer);
+  slashWaiters.delete(messageId);
+  w.resolve(embeds);
+  return true;
+}
+
+function installRawPacketCapture(c) {
+  const ws = c.ws;
+  if (!ws || typeof ws.handlePacket !== "function" || ws.__rawCaptureInstalled) return;
+  const orig = ws.handlePacket.bind(ws);
+  ws.handlePacket = (packet, shard) => {
+    try {
+      if (packet && (packet.t === "MESSAGE_UPDATE" || packet.t === "MESSAGE_CREATE")) {
+        const d = packet.d;
+        if (
+          d &&
+          String(d.channel_id) === String(roverChannelId) &&
+          d.author &&
+          String(d.author.id) === String(verifyAppId)
+        ) {
+          const n = Array.isArray(d.embeds) ? d.embeds.length : 0;
+          console.log(`  → [raw ${packet.t === "MESSAGE_CREATE" ? "MC" : "MU"}] id=${d.id} embeds=${n}`);
+          if (n > 0) {
+            // Match the deferred message id; if a follow-up arrived under a new id and
+            // there's exactly one outstanding request, deliver to it.
+            if (!deliverSlashEmbeds(d.id, d.embeds) && slashWaiters.size === 1) {
+              const [mid] = slashWaiters.keys();
+              deliverSlashEmbeds(mid, d.embeds);
+            }
+          }
+        }
+      }
+    } catch (e) {}
+    return orig(packet, shard);
+  };
+  ws.__rawCaptureInstalled = true;
+  console.log("  → Raw packet capture installed for verify channel");
+}
+
 const client = new Client({ checkUpdate: false });
 const client2 = new Client({ checkUpdate: false }); // Second client for sending messages
 let isShuttingDown = false;
+installRawPacketCapture(client);
 
 client.on("ready", () => {
   ensureDataDir();
+  installRawPacketCapture(client);
   console.log(`Monitoring channels ${channelIds.join(", ")} for messages...`);
   if (BLOXLINK_API_KEY) {
     console.log(
@@ -1058,11 +1120,15 @@ client.on("messageCreate", async (message) => {
         `  → [reply raw] id=${responseMsg?.id ?? "?"} author=${responseMsg?.author?.id ?? "?"} embeds=${responseMsg?.embeds?.length ?? 0} flags=${flagStr} content="${String(responseMsg?.content || "").slice(0, 60)}"`
       );
     } catch {}
-    responseMsg = await resolveSlashResponse(responseMsg, verifyChannel);
-    console.log(`  → [reply resolved] id=${responseMsg?.id ?? "?"} embeds=${responseMsg?.embeds?.length ?? 0}`);
     const pending = pendingChecks.get(userIdStr);
-    const embeds = (responseMsg && responseMsg.embeds) || [];
-    if (embeds.length && pending) {
+    // The reply is ephemeral, so wait for the raw gateway packet (captured above)
+    // rather than re-fetching over REST (which 404s).
+    let embeds = responseMsg && responseMsg.embeds && responseMsg.embeds.length ? responseMsg.embeds : null;
+    if (!embeds && responseMsg?.id) {
+      embeds = await registerSlashWaiter(responseMsg.id);
+    }
+    console.log(`  → [reply resolved] id=${responseMsg?.id ?? "?"} embeds=${embeds?.length ?? 0}`);
+    if (embeds && embeds.length && pending) {
       // Bloxlink returns a "Roblox Information" embed and a "Discord Information" embed;
       // pick the one that actually yields a Roblox user id.
       let robloxEmbed = embeds[0];
