@@ -19,6 +19,17 @@ function ensureDataDir() {
 }
 ensureDataDir(); // Run at startup so saves work
 
+// The archived self-bot lib can leak a REST rejection (e.g. Discord 503 on
+// POST /interactions) out of its awaited promise. Without these guards a single
+// transient interaction error crashes the whole notifier.
+process.on("unhandledRejection", (reason) => {
+  const msg = reason && reason.message ? reason.message : String(reason);
+  console.error("⚠️ Unhandled rejection (ignored, staying up):", msg);
+});
+process.on("uncaughtException", (err) => {
+  console.error("⚠️ Uncaught exception (ignored, staying up):", err && err.message ? err.message : err);
+});
+
 function normalizeUsername(name) {
   if (!name || typeof name !== "string") return "";
   return name
@@ -96,6 +107,86 @@ const webhookUrl = getEnv("WEBHOOK_URL");
 const claimChannelId = parseId(getEnv("CLAIM_CHANNEL_ID"));
 const targetGroupChatId = parseId(getEnv("TARGET_GROUP_CHAT_ID"));
 const secondToken = getEnv("DISCORD_TOKEN_2");
+
+const VERIFY_SLASH_MAX_RETRIES = Math.min(
+  12,
+  Math.max(1, parseInt(String(getEnv("VERIFY_SLASH_MAX_RETRIES", "5")), 10) || 5)
+);
+const VERIFY_SLASH_BASE_DELAY_MS = Math.min(
+  60000,
+  Math.max(250, parseInt(String(getEnv("VERIFY_SLASH_BASE_DELAY_MS", "2000")), 10) || 2000)
+);
+const VERIFY_SLASH_MIN_INTERVAL_MS = Math.min(
+  10000,
+  Math.max(0, parseInt(String(getEnv("VERIFY_SLASH_MIN_INTERVAL_MS", "600")), 10) || 600)
+);
+
+let lastVerificationSlashAt = 0;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function restStatusFromError(err) {
+  if (!err) return null;
+  const s = err.status ?? err.statusCode ?? err.httpStatus;
+  if (typeof s === "number" && s > 0) return s;
+  const msg = String(err.message || err);
+  if (/503|service unavailable/i.test(msg)) return 503;
+  if (/502|bad gateway/i.test(msg)) return 502;
+  if (/504|gateway time-?out/i.test(msg)) return 504;
+  if (/429|rate ?limit/i.test(msg)) return 429;
+  return null;
+}
+
+function isRetryableDiscordInteractionError(err) {
+  const s = restStatusFromError(err);
+  if (s === 502 || s === 503 || s === 504 || s === 429) return true;
+  const code = err && err.code;
+  if (code === "ECONNRESET" || code === "ETIMEDOUT" || code === "ENOTFOUND") return true;
+  return false;
+}
+
+async function maybeThrottleVerificationSlash() {
+  if (VERIFY_SLASH_MIN_INTERVAL_MS <= 0) return;
+  const now = Date.now();
+  const wait = lastVerificationSlashAt + VERIFY_SLASH_MIN_INTERVAL_MS - now;
+  if (wait > 0) await sleep(wait);
+  lastVerificationSlashAt = Date.now();
+}
+
+/** Discord /interactions sometimes returns 503/502/504; selfbots also hit rate limits (429). */
+async function sendVerificationSlash(verifyChannel, appId, command, userId) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= VERIFY_SLASH_MAX_RETRIES; attempt++) {
+    await maybeThrottleVerificationSlash();
+    try {
+      await verifyChannel.sendSlash(appId, command, userId);
+      if (attempt > 1) console.log(`  → Slash succeeded on attempt ${attempt}`);
+      return;
+    } catch (e) {
+      lastErr = e;
+      const s = restStatusFromError(e);
+      const retryable = isRetryableDiscordInteractionError(e);
+      if (!retryable || attempt >= VERIFY_SLASH_MAX_RETRIES) {
+        throw e;
+      }
+      let delay = VERIFY_SLASH_BASE_DELAY_MS * 2 ** (attempt - 1);
+      if (s === 429) {
+        const ra = e?.rawError?.retry_after ?? e?.retry_after;
+        if (typeof ra === "number" && ra > 0) {
+          delay = Math.max(delay, ra * 1000);
+        }
+      }
+      delay = Math.min(delay, 60000);
+      console.warn(
+        `  → Slash transient (${s ?? "network"}), retry ${attempt}/${VERIFY_SLASH_MAX_RETRIES} in ${delay}ms: ${e.message}`
+      );
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
 
 const pendingChecks = new Map(); // userId -> { message, channelId, ... }
 const loggedUserData = loadLoggedUsers(); // { ids, usernames } - persisted
@@ -489,6 +580,13 @@ client.on("messageCreate", async (message) => {
 
     const robloxUserId = parseRobloxUserIdFromVerificationEmbed(embed);
 
+    // Diagnostic: show exactly what the verification bot returned so we can confirm parsing
+    console.log(
+      `  → [verify embed] parsedDiscord="${discordUser || ""}" parsedRobloxId=${robloxUserId || "none"} | ` +
+        `title="${embed.title || ""}" desc="${(embed.description || "").slice(0, 160)}" ` +
+        `fields=[${(embed.fields || []).map((f) => `${f.name}=${String(f.value || "").slice(0, 40)}`).join(" | ")}]`
+    );
+
     // Match this embed to the correct pending check by Discord username (bot can respond out of order)
     let discordUserId = null;
     let pending = null;
@@ -674,7 +772,7 @@ client.on("messageCreate", async (message) => {
 
   try {
     const verifyChannel = await client.channels.fetch(roverChannelId);
-    await verifyChannel.sendSlash(verifyAppId, verifySlashCommand, userId);
+    await sendVerificationSlash(verifyChannel, verifyAppId, verifySlashCommand, userId);
     console.log(`  → Sent /${verifySlashCommand.replace(/\s+/g, " ")} (${verifyBot})`);
   } catch (e) {
     console.error("  → Slash failed:", e.message);
