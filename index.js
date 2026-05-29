@@ -570,30 +570,19 @@ function isVerifiedOrNoviceOrLower(member, guild) {
  * often "defers" first (LOADING flag) then edits in the real embed, which arrives
  * via messageUpdate — never as a normal messageCreate. Resolve to the final reply.
  */
-async function resolveSlashResponse(message, timeoutMs = 15000) {
+async function resolveSlashResponse(message, verifyChannel, { tries = 8, intervalMs = 900 } = {}) {
   if (!message) return null;
-  try {
-    const isLoading = message.flags && typeof message.flags.has === "function" && message.flags.has("LOADING");
-    const hasEmbed = message.embeds && message.embeds.length;
-    if (isLoading || !hasEmbed) {
-      return await new Promise((resolve) => {
-        let done = false;
-        const finish = (m) => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          client.off("messageUpdate", onUpdate);
-          resolve(m);
-        };
-        const onUpdate = (_oldM, newM) => {
-          if (newM && newM.id === message.id && newM.embeds && newM.embeds.length) finish(newM);
-        };
-        const timer = setTimeout(() => finish(message), timeoutMs);
-        client.on("messageUpdate", onUpdate);
-      });
-    }
-  } catch (e) {
-    console.error("  → resolveSlashResponse error:", e.message);
+  if (message.embeds && message.embeds.length) return message;
+  const id = message.id;
+  if (!id || !verifyChannel) return message;
+  // Bloxlink defers (LOADING, no embeds) then edits the embeds in. The messageUpdate
+  // event only delivers a partial (embeds=0), so re-fetch the message until it's populated.
+  for (let i = 0; i < tries; i++) {
+    await sleep(intervalMs);
+    try {
+      const fresh = await verifyChannel.messages.fetch(id);
+      if (fresh && fresh.embeds && fresh.embeds.length) return fresh;
+    } catch (e) {}
   }
   return message;
 }
@@ -603,9 +592,9 @@ async function processVerificationResult(embed, discordUserId, pending) {
   if (!embed || !pending) return;
 
   const discordUser =
-    parseDiscordUserFromVerificationEmbed(embed) ||
-    pending.displayName ||
     pending.discordUsername ||
+    pending.displayName ||
+    parseDiscordUserFromVerificationEmbed(embed) ||
     String(discordUserId);
   const robloxUserId = parseRobloxUserIdFromVerificationEmbed(embed);
 
@@ -940,11 +929,21 @@ client.on("messageCreate", async (message) => {
         `  → [reply raw] id=${responseMsg?.id ?? "?"} author=${responseMsg?.author?.id ?? "?"} embeds=${responseMsg?.embeds?.length ?? 0} flags=${flagStr} content="${String(responseMsg?.content || "").slice(0, 60)}"`
       );
     } catch {}
-    responseMsg = await resolveSlashResponse(responseMsg);
+    responseMsg = await resolveSlashResponse(responseMsg, verifyChannel);
     console.log(`  → [reply resolved] id=${responseMsg?.id ?? "?"} embeds=${responseMsg?.embeds?.length ?? 0}`);
     const pending = pendingChecks.get(userIdStr);
-    if (responseMsg && responseMsg.embeds && responseMsg.embeds.length && pending) {
-      await processVerificationResult(responseMsg.embeds[0], userId, pending);
+    const embeds = (responseMsg && responseMsg.embeds) || [];
+    if (embeds.length && pending) {
+      // Bloxlink returns a "Roblox Information" embed and a "Discord Information" embed;
+      // pick the one that actually yields a Roblox user id.
+      let robloxEmbed = embeds[0];
+      for (const e of embeds) {
+        if (parseRobloxUserIdFromVerificationEmbed(e)) {
+          robloxEmbed = e;
+          break;
+        }
+      }
+      await processVerificationResult(robloxEmbed, userId, pending);
     } else {
       console.log(`  → No embed in /getinfo reply for ${userId}`);
     }
