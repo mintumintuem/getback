@@ -113,6 +113,9 @@ const secondToken = getEnv("DISCORD_TOKEN_2");
 // Guild id is optional — without it we use Bloxlink's global endpoint.
 const BLOXLINK_API_KEY = getEnv("BLOXLINK_API_KEY");
 const BLOXLINK_GUILD_ID = parseId(getEnv("BLOXLINK_GUILD_ID"));
+// When false (default), only users with a resolved Roblox account that pass the RAP
+// filter get a webhook. Set LOG_UNLINKED=true to also post "RAP: N/A" for unlinked users.
+const LOG_UNLINKED = getEnv("LOG_UNLINKED", "false").toLowerCase() === "true";
 
 const VERIFY_SLASH_MAX_RETRIES = Math.min(
   12,
@@ -641,25 +644,32 @@ function isVerifiedOrNoviceOrLower(member, guild) {
  * often "defers" first (LOADING flag) then edits in the real embed, which arrives
  * via messageUpdate — never as a normal messageCreate. Resolve to the final reply.
  */
-async function resolveSlashResponse(message, verifyChannel, { tries = 8, intervalMs = 900 } = {}) {
+async function resolveSlashResponse(message, verifyChannel, { tries = 10, intervalMs = 900 } = {}) {
   if (!message) return null;
   if (message.embeds && message.embeds.length) return message;
   const id = message.id;
-  if (!id || !verifyChannel) return message;
-  // Bloxlink defers (LOADING, no embeds) then edits the embeds in. The messageUpdate
-  // event only delivers a partial (embeds=0) and caches it, so force a fresh API fetch
-  // (bypassing cache) until the embeds are populated.
-  let lastFetchErr = null;
+  const channelId = verifyChannel?.id;
+  if (!id || !channelId) return message;
+  // Bloxlink defers (LOADING, no embeds) then edits the embeds in. The library's
+  // messages.fetch() does a `?around=` channel-history scan that returns embeds=0,
+  // so hit Discord's real single-message endpoint (GET /channels/:c/messages/:m)
+  // directly via the raw REST router until the embeds are populated.
+  const api = (verifyChannel.client && verifyChannel.client.api) || client.api;
+  let lastErr = null;
   for (let i = 0; i < tries; i++) {
     await sleep(intervalMs);
     try {
-      const fresh = await verifyChannel.messages.fetch(id, { force: true });
-      if (fresh && fresh.embeds && fresh.embeds.length) return fresh;
+      const raw = await api.channels(channelId).messages(id).get();
+      if (raw && Array.isArray(raw.embeds) && raw.embeds.length) {
+        // Raw Discord embed JSON (author.name, title, fields[], thumbnail.url, ...)
+        // is already shaped the way our parsers expect.
+        return { id: raw.id, content: raw.content, author: raw.author, embeds: raw.embeds, flags: raw.flags };
+      }
     } catch (e) {
-      lastFetchErr = e;
+      lastErr = e;
     }
   }
-  if (lastFetchErr) console.log(`  → [resolve] fetch error for ${id}: ${lastFetchErr.message}`);
+  if (lastErr) console.log(`  → [resolve] raw fetch error for ${id}: ${lastErr.message || lastErr}`);
   return message;
 }
 
@@ -702,6 +712,7 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
   }
 
   function shouldLogWithoutRobloxId() {
+    if (!LOG_UNLINKED) return false;
     if (robloxUserId || !discordUser) return false;
     const t = (discordUser || "").trim().toLowerCase();
     if (["error", "oops", "failed", "invalid", "warning"].includes(t)) return false;
@@ -861,6 +872,7 @@ client.on("messageCreate", async (message) => {
 
     /** Embed has no Roblox user id — still log Discord user when clearly unlinked / we have a display name */
     function shouldLogWithoutRobloxId() {
+      if (!LOG_UNLINKED) return false;
       if (robloxUserId || !cleanUsername) return false;
       const t = (discordUser || "").trim().toLowerCase();
       if (["error", "oops", "failed", "invalid", "warning"].includes(t)) return false;
