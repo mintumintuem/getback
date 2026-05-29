@@ -108,6 +108,12 @@ const claimChannelId = parseId(getEnv("CLAIM_CHANNEL_ID"));
 const targetGroupChatId = parseId(getEnv("TARGET_GROUP_CHAT_ID"));
 const secondToken = getEnv("DISCORD_TOKEN_2");
 
+// Preferred: resolve Discord→Roblox via Bloxlink's official API instead of scraping
+// the flaky /getinfo slash reply. Get a key at https://blox.link/dashboard/user/developer.
+// Guild id is optional — without it we use Bloxlink's global endpoint.
+const BLOXLINK_API_KEY = getEnv("BLOXLINK_API_KEY");
+const BLOXLINK_GUILD_ID = parseId(getEnv("BLOXLINK_GUILD_ID"));
+
 const VERIFY_SLASH_MAX_RETRIES = Math.min(
   12,
   Math.max(1, parseInt(String(getEnv("VERIFY_SLASH_MAX_RETRIES", "5")), 10) || 5)
@@ -186,6 +192,60 @@ async function sendVerificationSlash(verifyChannel, appId, command, userId) {
     }
   }
   throw lastErr;
+}
+
+function parseBloxlinkResolve(data) {
+  const robloxId =
+    (data && data.robloxID) ||
+    (data && data.resolved && data.resolved.roblox && data.resolved.roblox.id) ||
+    null;
+  if (!robloxId) return { ok: true, notLinked: true };
+  const roblox = (data && data.resolved && data.resolved.roblox) || {};
+  return { ok: true, robloxId: String(robloxId), robloxName: roblox.name || roblox.displayName || null };
+}
+
+/**
+ * Resolve a Discord user id to a Roblox id via Bloxlink's official public API.
+ * Returns { ok, robloxId?, robloxName?, notLinked? }. ok=false means a transient
+ * API failure (caller should not treat it as "unlinked").
+ */
+async function bloxlinkDiscordToRoblox(discordUserId, guildId) {
+  if (!BLOXLINK_API_KEY) return { ok: false };
+  const gid = BLOXLINK_GUILD_ID || guildId || null;
+  const base = "https://api.blox.link/v4/public";
+  const url = gid
+    ? `${base}/guilds/${gid}/discord-to-roblox/${discordUserId}`
+    : `${base}/discord-to-roblox/${discordUserId}`;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url, { headers: { Authorization: BLOXLINK_API_KEY } });
+      if (res.status === 404) return { ok: true, notLinked: true };
+      if (res.status === 429 || res.status === 503 || res.status === 502) {
+        if (attempt < 3) {
+          await sleep(1500 * attempt);
+          continue;
+        }
+        console.warn(`  → Bloxlink API ${res.status} (giving up) for ${discordUserId}`);
+        return { ok: false };
+      }
+      if (!res.ok) {
+        console.warn(`  → Bloxlink API ${res.status} for ${discordUserId}`);
+        return { ok: false };
+      }
+      const data = await res.json().catch(() => null);
+      // Bloxlink sometimes returns 200 with { error: "...not linked..." }
+      if (data && data.error && !data.robloxID) return { ok: true, notLinked: true };
+      return parseBloxlinkResolve(data);
+    } catch (e) {
+      if (attempt < 3) {
+        await sleep(1500 * attempt);
+        continue;
+      }
+      console.warn(`  → Bloxlink API error for ${discordUserId}: ${e.message}`);
+      return { ok: false };
+    }
+  }
+  return { ok: false };
 }
 
 const pendingChecks = new Map(); // userId -> { message, channelId, ... }
@@ -386,8 +446,15 @@ let isShuttingDown = false;
 client.on("ready", () => {
   ensureDataDir();
   console.log(`Monitoring channels ${channelIds.join(", ")} for messages...`);
-  console.log(`Verification bot: ${verifyBot} (slash: /${verifySlashCommand.replace(/\s+/g, " ")})`);
-  console.log(`Verification channel: ${roverChannelId}`);
+  if (BLOXLINK_API_KEY) {
+    console.log(
+      `Verification: Bloxlink API (${BLOXLINK_GUILD_ID ? `guild ${BLOXLINK_GUILD_ID}` : "global endpoint"})`
+    );
+  } else {
+    console.log(`Verification bot: ${verifyBot} (slash: /${verifySlashCommand.replace(/\s+/g, " ")})`);
+    console.log(`Verification channel: ${roverChannelId}`);
+    console.log("  → Tip: set BLOXLINK_API_KEY to use the reliable Bloxlink API instead of slash scraping.");
+  }
   if (!channelIds.length) {
     console.warn("  → CHANNEL_IDS is empty after parsing. Check your .env formatting.");
   }
@@ -592,7 +659,7 @@ async function resolveSlashResponse(message, verifyChannel, { tries = 8, interva
   return message;
 }
 
-/** Parse a verification reply embed, apply RAP/activity/novice filters, and send the webhook. */
+/** Parse a verification reply embed, then run filters + webhook via finalizeAndSendWebhook. */
 async function processVerificationResult(embed, discordUserId, pending) {
   if (!embed || !pending) return;
 
@@ -610,14 +677,25 @@ async function processVerificationResult(embed, discordUserId, pending) {
       `fields=[${(embed.fields || []).map((f) => `${f.name}=${String(f.value || "").slice(0, 40)}`).join(" | ")}]`
   );
 
+  await finalizeAndSendWebhook({
+    robloxUserId,
+    discordUser,
+    discordUserId,
+    pending,
+    avatarUrl: embed.thumbnail?.url || embed.image?.url,
+    isNotLinked: isUnlinkedVerificationEmbed(embed),
+  });
+}
+
+/** Apply RAP/activity/novice filters to a resolved (discord→roblox) result and send the webhook. */
+async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId, pending, avatarUrl, isNotLinked }) {
+  if (!pending) return;
+
   const discordIdStr = String(discordUserId);
   if (loggedUserData.ids.has(discordIdStr)) {
     console.log(`  → Skipped (already logged: ${discordUser || discordUserId})`);
     return;
   }
-
-  const avatarUrl = embed.thumbnail?.url || embed.image?.url;
-  const isNotLinked = isUnlinkedVerificationEmbed(embed);
 
   function shouldLogWithoutRobloxId() {
     if (robloxUserId || !discordUser) return false;
@@ -919,6 +997,36 @@ client.on("messageCreate", async (message) => {
     displayName: displayName,
     guildId: message.guild?.id,
   });
+
+  // Preferred path: resolve via Bloxlink's official API (reliable, no slash scraping).
+  if (BLOXLINK_API_KEY) {
+    try {
+      const pending = pendingChecks.get(userIdStr);
+      const result = await bloxlinkDiscordToRoblox(userId, message.guild?.id);
+      if (!result.ok) {
+        console.log(`  → Bloxlink API lookup failed for ${userId} (will retry on next message)`);
+        checkedUsers.delete(userIdStr); // allow another attempt later
+      } else {
+        const discordUser = pending?.discordUsername || pending?.displayName || String(userId);
+        console.log(
+          `  → [bloxlink api] ${userId} → roblox=${result.robloxId || "none"}${result.notLinked ? " (not linked)" : ""}`
+        );
+        await finalizeAndSendWebhook({
+          robloxUserId: result.robloxId || null,
+          discordUser,
+          discordUserId: userId,
+          pending,
+          avatarUrl: null,
+          isNotLinked: !!result.notLinked,
+        });
+      }
+    } catch (e) {
+      console.error("  → Bloxlink API path error:", e.message);
+    } finally {
+      pendingChecks.delete(userIdStr);
+    }
+    return;
+  }
 
   try {
     const verifyChannel = await client.channels.fetch(roverChannelId);
