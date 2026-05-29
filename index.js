@@ -209,9 +209,12 @@ function parseBloxlinkResolve(data) {
  * Returns { ok, robloxId?, robloxName?, notLinked? }. ok=false means a transient
  * API failure (caller should not treat it as "unlinked").
  */
-async function bloxlinkDiscordToRoblox(discordUserId, guildId) {
+async function bloxlinkDiscordToRoblox(discordUserId) {
   if (!BLOXLINK_API_KEY) return { ok: false };
-  const gid = BLOXLINK_GUILD_ID || guildId || null;
+  // A server (guild) API key only works against its own guild. Never use the
+  // monitored message's guild here — that would be the Rolimons guild, which the
+  // key isn't bound to. Use the configured guild, or the global endpoint.
+  const gid = BLOXLINK_GUILD_ID || null;
   const base = "https://api.blox.link/v4/public";
   const url = gid
     ? `${base}/guilds/${gid}/discord-to-roblox/${discordUserId}`
@@ -1003,7 +1006,7 @@ client.on("messageCreate", async (message) => {
   if (BLOXLINK_API_KEY) {
     try {
       const pending = pendingChecks.get(userIdStr);
-      const result = await bloxlinkDiscordToRoblox(userId, message.guild?.id);
+      const result = await bloxlinkDiscordToRoblox(userId);
       if (!result.ok) {
         console.log(`  → Bloxlink API lookup failed for ${userId} (will retry on next message)`);
         checkedUsers.delete(userIdStr); // allow another attempt later
