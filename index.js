@@ -486,10 +486,17 @@ function installRawPacketCapture(c) {
         // embed ever arrives from any source — webhook, follow-up, different id, etc.
         if (d && String(d.channel_id) === String(roverChannelId)) {
           const n = Array.isArray(d.embeds) ? d.embeds.length : 0;
+          const cn = Array.isArray(d.components) ? d.components.length : 0;
           const kind = packet.t === "MESSAGE_CREATE" ? "MC" : "MU";
           console.log(
-            `  → [raw ${kind}] id=${d.id} author=${d.author?.id ?? "?"} bot=${d.author?.bot ?? "?"} embeds=${n} flags=${d.flags ?? 0} content="${String(d.content || "").slice(0, 40)}"`
+            `  → [raw ${kind}] id=${d.id} author=${d.author?.id ?? "?"} bot=${d.author?.bot ?? "?"} embeds=${n} components=${cn} flags=${d.flags ?? 0} content="${String(d.content || "").slice(0, 40)}"`
           );
+          // Bloxlink moved /getinfo to Components V2 (flag 1<<15 = 32768): the data lives
+          // in `components`, not `embeds`. Dump the raw components JSON once so we can build
+          // an exact parser.
+          if (cn > 0) {
+            console.log(`  → [raw components] id=${d.id}: ${JSON.stringify(d.components).slice(0, 1500)}`);
+          }
           if (n > 0) {
             // Deliver to the matching waiter by id; otherwise, if there's exactly one
             // outstanding request, deliver to it (covers follow-ups under a new id).
