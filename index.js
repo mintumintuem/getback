@@ -161,9 +161,9 @@ async function sendVerificationSlash(verifyChannel, appId, command, userId) {
   for (let attempt = 1; attempt <= VERIFY_SLASH_MAX_RETRIES; attempt++) {
     await maybeThrottleVerificationSlash();
     try {
-      await verifyChannel.sendSlash(appId, command, userId);
+      const res = await verifyChannel.sendSlash(appId, command, userId);
       if (attempt > 1) console.log(`  → Slash succeeded on attempt ${attempt}`);
-      return;
+      return res;
     } catch (e) {
       lastErr = e;
       const s = restStatusFromError(e);
@@ -558,6 +558,151 @@ function isVerifiedOrNoviceOrLower(member, guild) {
   return memberHighest.position <= noviceRole.position; // Novice or lower (no elevated role)
 }
 
+/**
+ * sendSlash returns the bot's reply. Bloxlink /getinfo replies ephemerally and
+ * often "defers" first (LOADING flag) then edits in the real embed, which arrives
+ * via messageUpdate — never as a normal messageCreate. Resolve to the final reply.
+ */
+async function resolveSlashResponse(message, timeoutMs = 15000) {
+  if (!message) return null;
+  try {
+    const isLoading = message.flags && typeof message.flags.has === "function" && message.flags.has("LOADING");
+    const hasEmbed = message.embeds && message.embeds.length;
+    if (isLoading || !hasEmbed) {
+      return await new Promise((resolve) => {
+        let done = false;
+        const finish = (m) => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          client.off("messageUpdate", onUpdate);
+          resolve(m);
+        };
+        const onUpdate = (_oldM, newM) => {
+          if (newM && newM.id === message.id && newM.embeds && newM.embeds.length) finish(newM);
+        };
+        const timer = setTimeout(() => finish(message), timeoutMs);
+        client.on("messageUpdate", onUpdate);
+      });
+    }
+  } catch (e) {
+    console.error("  → resolveSlashResponse error:", e.message);
+  }
+  return message;
+}
+
+/** Parse a verification reply embed, apply RAP/activity/novice filters, and send the webhook. */
+async function processVerificationResult(embed, discordUserId, pending) {
+  if (!embed || !pending) return;
+
+  const discordUser =
+    parseDiscordUserFromVerificationEmbed(embed) ||
+    pending.displayName ||
+    pending.discordUsername ||
+    String(discordUserId);
+  const robloxUserId = parseRobloxUserIdFromVerificationEmbed(embed);
+
+  // Diagnostic: show exactly what the verification bot returned so we can confirm parsing
+  console.log(
+    `  → [verify embed] parsedDiscord="${discordUser || ""}" parsedRobloxId=${robloxUserId || "none"} | ` +
+      `title="${embed.title || ""}" desc="${(embed.description || "").slice(0, 160)}" ` +
+      `fields=[${(embed.fields || []).map((f) => `${f.name}=${String(f.value || "").slice(0, 40)}`).join(" | ")}]`
+  );
+
+  const discordIdStr = String(discordUserId);
+  if (loggedUserData.ids.has(discordIdStr)) {
+    console.log(`  → Skipped (already logged: ${discordUser || discordUserId})`);
+    return;
+  }
+
+  const avatarUrl = embed.thumbnail?.url || embed.image?.url;
+  const isNotLinked = isUnlinkedVerificationEmbed(embed);
+
+  function shouldLogWithoutRobloxId() {
+    if (robloxUserId || !discordUser) return false;
+    const t = (discordUser || "").trim().toLowerCase();
+    if (["error", "oops", "failed", "invalid", "warning"].includes(t)) return false;
+    return isNotLinked || !!discordUser;
+  }
+
+  let rapNum = null;
+  let finalRobloxUserId = robloxUserId;
+
+  if (robloxUserId) {
+    console.log(`  → Roblox ID: ${robloxUserId}, Discord: ${discordUser || discordUserId}`);
+    const { rap } = await fetchRobloxRAP(robloxUserId);
+    rapNum = rap != null ? Number(rap) : NaN;
+
+    const hasBypassPhrase = messageHasBypassPhrase(pending.message);
+    const hasWL = messageHasWL(pending.message);
+
+    if (hasWL) {
+      if (!Number.isNaN(rapNum) && rapNum < MIN_RAP_WL) {
+        console.log(`  → Skipped (w/l: RAP ${rapNum.toLocaleString()} < ${MIN_RAP_WL.toLocaleString()})`);
+        return;
+      }
+    } else if (!hasBypassPhrase) {
+      if (Number.isNaN(rapNum) || rapNum < MIN_RAP) {
+        console.log(`  → Skipped (RAP ${rap ?? "N/A"} < ${MIN_RAP.toLocaleString()})`);
+        return;
+      }
+    }
+    rapNum = Number.isNaN(rapNum) ? null : rapNum;
+  } else if (shouldLogWithoutRobloxId()) {
+    console.log(
+      `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP: N/A)`
+    );
+    finalRobloxUserId = null;
+    rapNum = null;
+  } else {
+    console.log("  → No Roblox User ID found in embed, skipping");
+    return;
+  }
+
+  if (isTooActive(discordUserId)) {
+    console.log(`  → Skipped (too active in Rolimons)`);
+    return;
+  }
+
+  try {
+    const channel = await client.channels.fetch(pending.channelId).catch(() => null);
+    const guild = channel?.guild;
+    const member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
+    if (isNoviceExcludingVerified(member, guild)) {
+      if (!messageHasNoviceBypassPhrase(pending.message)) {
+        if (!meetsNoviceActivityRequirements(discordUserId)) {
+          const timestamps = userActivity.get(discordUserId) || [];
+          const now = Date.now();
+          const in2w = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
+          console.log(`  → Skipped (novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
+          return;
+        }
+      }
+    }
+  } catch (e) {
+    console.error("  → Novice check error:", e.message);
+  }
+
+  const now = Date.now();
+  if (recentWebhooks.has(discordIdStr) && now - recentWebhooks.get(discordIdStr) < WEBHOOK_DEBOUNCE_MS) {
+    console.log(`  → Skipped (duplicate, sent for ${discordUser} recently)`);
+    return;
+  }
+  recentWebhooks.set(discordIdStr, now);
+
+  await sendWebhook({
+    robloxUserId: finalRobloxUserId,
+    discordUser,
+    discordUserId: discordIdStr,
+    rap: rapNum,
+    message: pending.message,
+    channelId: pending.channelId,
+    messageId: pending.messageId,
+    guildId: pending.guildId,
+    avatarUrl,
+  });
+}
+
 client.on("messageCreate", async (message) => {
   const channelId = message.channel?.id;
   const authorId = message.author?.id;
@@ -772,8 +917,19 @@ client.on("messageCreate", async (message) => {
 
   try {
     const verifyChannel = await client.channels.fetch(roverChannelId);
-    await sendVerificationSlash(verifyChannel, verifyAppId, verifySlashCommand, userId);
+    let responseMsg = await sendVerificationSlash(verifyChannel, verifyAppId, verifySlashCommand, userId);
     console.log(`  → Sent /${verifySlashCommand.replace(/\s+/g, " ")} (${verifyBot})`);
+
+    // Bloxlink replies ephemerally to the slash command — read the returned reply
+    // directly instead of waiting for a messageCreate that never fires.
+    responseMsg = await resolveSlashResponse(responseMsg);
+    const pending = pendingChecks.get(userIdStr);
+    if (responseMsg && responseMsg.embeds && responseMsg.embeds.length && pending) {
+      await processVerificationResult(responseMsg.embeds[0], userId, pending);
+    } else {
+      console.log(`  → No embed in /getinfo reply for ${userId}`);
+    }
+    pendingChecks.delete(userIdStr);
   } catch (e) {
     console.error("  → Slash failed:", e.message);
     pendingChecks.delete(userIdStr);
