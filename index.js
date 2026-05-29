@@ -6,6 +6,7 @@ const path = require("path");
 // Use persistent storage on Railway (set DATA_DIR=/data and add a Volume mounted at /data)
 const DATA_DIR = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
 const LOGGED_USERS_FILE = path.join(DATA_DIR, "logged_users.json");
+const ACTIVITY_FILE = path.join(DATA_DIR, "user_activity.json");
 
 function ensureDataDir() {
   if (DATA_DIR !== __dirname && !fs.existsSync(DATA_DIR)) {
@@ -67,6 +68,39 @@ function saveLoggedUser(userId, username) {
     }));
   } catch (e) {
     console.error("  → Failed to save logged user:", e.message);
+  }
+}
+
+let activityDirty = false;
+
+function loadUserActivity() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(ACTIVITY_FILE, "utf8"));
+    const map = new Map();
+    const now = Date.now();
+    const cutoff = now - (90 * 24 * 60 * 60 * 1000); // prune anything older than ~3 months on load
+    for (const [id, ts] of Object.entries(parsed || {})) {
+      if (!Array.isArray(ts)) continue;
+      const kept = ts.filter((t) => typeof t === "number" && t > cutoff);
+      if (kept.length) map.set(String(id), kept);
+    }
+    return map;
+  } catch {
+    return new Map();
+  }
+}
+
+function saveUserActivity() {
+  if (!activityDirty) return;
+  try {
+    const obj = {};
+    for (const [id, ts] of userActivity.entries()) {
+      if (Array.isArray(ts) && ts.length) obj[id] = ts;
+    }
+    fs.writeFileSync(ACTIVITY_FILE, JSON.stringify(obj));
+    activityDirty = false;
+  } catch (e) {
+    console.error("  → Failed to save user activity:", e.message);
   }
 }
 
@@ -259,7 +293,7 @@ async function bloxlinkDiscordToRoblox(discordUserId) {
 const pendingChecks = new Map(); // userId -> { message, channelId, ... }
 const loggedUserData = loadLoggedUsers(); // { ids, usernames } - persisted
 const checkedUsers = new Set([...loggedUserData.ids]); // Includes persisted + session
-const userActivity = new Map(); // userId -> timestamp[] (for activity filtering)
+const userActivity = loadUserActivity(); // userId -> timestamp[] (persisted across restarts)
 const recentWebhooks = new Map(); // userId -> timestamp (prevent duplicate embeds)
 
 const TEN_DAYS_MS = 10 * 24 * 60 * 60 * 1000;
@@ -269,6 +303,22 @@ const THIRTY_FIVE_DAYS_MS = 35 * 24 * 60 * 60 * 1000; // Keep ~1 month for novic
 const ONE_MINUTE_MS = 60 * 1000;
 const WEBHOOK_DEBOUNCE_MS = 90 * 1000; // Prevent duplicate webhooks for same user
 const MIN_RAP = 100000; // Minimum RAP to send webhook embed
+
+// Higher-than-regular role filter: a member whose highest role sits above the
+// "regular" role only qualifies if they've sent <= N messages in the trailing window.
+// (Counts only messages the bot has observed; persisted to DATA_DIR across restarts.)
+const REGULAR_ROLE_NAME = getEnv("REGULAR_ROLE_NAME", "regular").toLowerCase();
+const HIGHER_ROLE_WINDOW_DAYS = Math.max(
+  1,
+  parseInt(String(getEnv("HIGHER_ROLE_WINDOW_DAYS", "90")), 10) || 90
+);
+const HIGHER_ROLE_WINDOW_MS = HIGHER_ROLE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+const HIGHER_ROLE_MAX_MESSAGES = Math.max(
+  0,
+  parseInt(String(getEnv("HIGHER_ROLE_MAX_MESSAGES", "15")), 10)
+);
+// Keep enough history to cover both the novice (~1mo) and higher-role windows.
+const ACTIVITY_RETENTION_MS = Math.max(THIRTY_FIVE_DAYS_MS, HIGHER_ROLE_WINDOW_MS);
 const MIN_RAP_WL = 150000; // For w/l messages: send only if N/A (privated) or above 150k
 const NOVICE_MAX_TOTAL_MESSAGES = 50; // Novices must have <50 messages to qualify (unless inactive 30+ days)
 const NOVICE_MAX_MESSAGES_IF_ACTIVE_2W = 5; // If active in past 2 weeks, max 3-5 messages in that period
@@ -293,8 +343,16 @@ function recordMessageActivity(userId) {
   const now = Date.now();
   if (!userActivity.has(userId)) userActivity.set(userId, []);
   userActivity.get(userId).push(now);
-  const cutoff = now - THIRTY_FIVE_DAYS_MS; // Keep ~1 month for novice filter
+  const cutoff = now - ACTIVITY_RETENTION_MS;
   userActivity.set(userId, userActivity.get(userId).filter((t) => t > cutoff));
+  activityDirty = true;
+}
+
+/** Count messages the bot observed from this user within the trailing window. */
+function messagesInWindow(userId, windowMs) {
+  const timestamps = userActivity.get(String(userId)) || [];
+  const now = Date.now();
+  return timestamps.filter((t) => now - t <= windowMs).length;
 }
 
 // Roles that always qualify (even above Novice) and skip novice activity rules — match server role names (case-insensitive)
@@ -340,6 +398,27 @@ function meetsNoviceActivityRequirements(userId) {
   }
   // <50 msgs: must be inactive 2+ weeks, OR if active in 2w then ≤5 msgs
   return inactive2Weeks || messagesInLast2Weeks <= NOVICE_MAX_MESSAGES_IF_ACTIVE_2W;
+}
+
+/** True if the member's highest role sits strictly above the configured "regular" role. */
+function memberIsAboveRegular(member, guild) {
+  if (!member || !guild) return false;
+  const regularRole = guild.roles?.cache?.find((r) => r.name.toLowerCase() === REGULAR_ROLE_NAME);
+  if (!regularRole) return false; // can't determine hierarchy → don't apply this filter
+  const memberHighest = member.roles?.highest;
+  if (!memberHighest) return false;
+  return memberHighest.position > regularRole.position;
+}
+
+/**
+ * Higher-than-regular members only qualify if they've been relatively quiet:
+ * <= HIGHER_ROLE_MAX_MESSAGES observed messages in the trailing window.
+ * Regular-or-lower members are unaffected (returns true).
+ */
+function passesHigherRoleActivityFilter(member, guild, userId) {
+  if (!memberIsAboveRegular(member, guild)) return true;
+  const count = messagesInWindow(userId, HIGHER_ROLE_WINDOW_MS);
+  return count <= HIGHER_ROLE_MAX_MESSAGES;
 }
 
 function isTooActive(userId) {
@@ -581,8 +660,23 @@ client.on("ready", () => {
   console.log(
     `Filters active: activity(1m>=2 or 10d>=2), novice(${NOVICE_MAX_TOTAL_MESSAGES} total, ${NOVICE_MAX_MESSAGES_IF_ACTIVE_2W} in 2w if active)`
   );
-  console.log(`Data dir: ${DATA_DIR} (logged users: ${loggedUserData.ids.size})`);
+  console.log(
+    `  → Higher-role filter: above '${REGULAR_ROLE_NAME}' must have <= ${HIGHER_ROLE_MAX_MESSAGES} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d`
+  );
+  console.log(`Data dir: ${DATA_DIR} (logged users: ${loggedUserData.ids.size}, tracked activity: ${userActivity.size})`);
 });
+
+// Flush observed activity to disk periodically so a redeploy doesn't reset counts.
+setInterval(saveUserActivity, 30 * 1000).unref?.();
+for (const sig of ["SIGINT", "SIGTERM"]) {
+  process.on(sig, () => {
+    try {
+      activityDirty = true;
+      saveUserActivity();
+    } catch {}
+    process.exit(0);
+  });
+}
 
 async function fetchRobloxRAP(robloxUserId) {
   try {
@@ -880,8 +974,16 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
         }
       }
     }
+    // Higher-than-regular roles must be relatively quiet (<= N msgs in the window).
+    if (!passesHigherRoleActivityFilter(member, guild, discordUserId)) {
+      const count = messagesInWindow(discordUserId, HIGHER_ROLE_WINDOW_MS);
+      console.log(
+        `  → Skipped (above '${REGULAR_ROLE_NAME}' role with ${count} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d > ${HIGHER_ROLE_MAX_MESSAGES})`
+      );
+      return;
+    }
   } catch (e) {
-    console.error("  → Novice check error:", e.message);
+    console.error("  → Role/activity check error:", e.message);
   }
 
   const now = Date.now();
@@ -1102,6 +1204,15 @@ client.on("messageCreate", async (message) => {
       console.log(`User ID: ${userId} (skipped - novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
       return;
     }
+  }
+
+  // Higher-than-regular roles must be relatively quiet (<= N msgs in the window).
+  if (member && message.guild && !passesHigherRoleActivityFilter(member, message.guild, userIdStr)) {
+    const count = messagesInWindow(userIdStr, HIGHER_ROLE_WINDOW_MS);
+    console.log(
+      `User ID: ${userId} (skipped - above '${REGULAR_ROLE_NAME}' role with ${count} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d > ${HIGHER_ROLE_MAX_MESSAGES})`
+    );
+    return;
   }
 
   console.log("User ID:", userId);
