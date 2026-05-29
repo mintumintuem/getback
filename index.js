@@ -301,6 +301,13 @@ function stripInlineMarkdown(value) {
 
 /** RoVer + Bloxlink embeds: fields, roblox.com/users/ID, numeric Roblox id fields */
 function parseRobloxUserIdFromVerificationEmbed(embed) {
+  // Bloxlink /getinfo puts the Roblox display name + id in the embed author/title,
+  // e.g. "Mace (311378850)". Roblox ids are <= 12 digits (Discord snowflakes are 17+).
+  for (const header of [embed.author?.name, embed.title]) {
+    if (!header) continue;
+    const m = String(header).match(/\((\d{4,12})\)/);
+    if (m) return m[1];
+  }
   for (const field of embed.fields || []) {
     const name = (field.name || "").toLowerCase();
     const raw = stripInlineMarkdown(String(field.value || "").trim());
@@ -317,7 +324,7 @@ function parseRobloxUserIdFromVerificationEmbed(embed) {
       return digits;
     }
   }
-  const blob = collectEmbedText(embed);
+  const blob = [embed.author?.name, collectEmbedText(embed)].filter(Boolean).join("\n");
   const urlMatch = blob.match(/roblox\.com\/users\/(\d+)/i);
   if (urlMatch) return urlMatch[1];
   return null;
@@ -707,6 +714,10 @@ client.on("messageCreate", async (message) => {
   const channelId = message.channel?.id;
   const authorId = message.author?.id;
 
+  if (channelId === roverChannelId && authorId === verifyAppId) {
+    console.log(`  → [MC verify] id=${message.id} embeds=${message.embeds?.length ?? 0}`);
+  }
+
   // Handle RoVer / Bloxlink embed response (same channel + verification bot application id)
   if (channelId === roverChannelId && authorId === verifyAppId && message.embeds?.length) {
     const embed = message.embeds[0];
@@ -922,7 +933,15 @@ client.on("messageCreate", async (message) => {
 
     // Bloxlink replies ephemerally to the slash command — read the returned reply
     // directly instead of waiting for a messageCreate that never fires.
+    try {
+      const f = responseMsg?.flags;
+      const flagStr = f && typeof f.toArray === "function" ? f.toArray().join(",") : (f?.bitfield ?? f ?? "?");
+      console.log(
+        `  → [reply raw] id=${responseMsg?.id ?? "?"} author=${responseMsg?.author?.id ?? "?"} embeds=${responseMsg?.embeds?.length ?? 0} flags=${flagStr} content="${String(responseMsg?.content || "").slice(0, 60)}"`
+      );
+    } catch {}
     responseMsg = await resolveSlashResponse(responseMsg);
+    console.log(`  → [reply resolved] id=${responseMsg?.id ?? "?"} embeds=${responseMsg?.embeds?.length ?? 0}`);
     const pending = pendingChecks.get(userIdStr);
     if (responseMsg && responseMsg.embeds && responseMsg.embeds.length && pending) {
       await processVerificationResult(responseMsg.embeds[0], userId, pending);
@@ -979,6 +998,15 @@ client2.on("messageCreate", async (message) => {
     const targetChannel = await client2.channels.fetch(targetGroupChatId).catch(() => null);
     if (targetChannel) { await targetChannel.send(discordUser); console.log(`[C] Sent "${discordUser}" to group chat`); }
   } catch (e) { console.error(`[C] Error:`, e.message); }
+});
+
+// Diagnostic: see if Bloxlink edits its deferred reply (messageUpdate) in the verify channel
+client.on("messageUpdate", (_oldMsg, newMsg) => {
+  try {
+    if (newMsg && newMsg.channel?.id === roverChannelId && newMsg.author?.id === verifyAppId) {
+      console.log(`  → [MU verify] id=${newMsg.id} embeds=${newMsg.embeds?.length ?? 0}`);
+    }
+  } catch {}
 });
 
 // Login both clients
