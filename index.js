@@ -453,7 +453,7 @@ function isUnlinkedVerificationEmbed(embed) {
 // hand the embeds to whoever is awaiting that deferred message id.
 const slashWaiters = new Map(); // deferred messageId -> { resolve, timer }
 
-function registerSlashWaiter(messageId, timeoutMs = 12000) {
+function registerSlashWaiter(messageId, timeoutMs = 20000) {
   return new Promise((resolve) => {
     const existing = slashWaiters.get(messageId);
     if (existing) clearTimeout(existing.timer);
@@ -482,17 +482,17 @@ function installRawPacketCapture(c) {
     try {
       if (packet && (packet.t === "MESSAGE_UPDATE" || packet.t === "MESSAGE_CREATE")) {
         const d = packet.d;
-        if (
-          d &&
-          String(d.channel_id) === String(roverChannelId) &&
-          d.author &&
-          String(d.author.id) === String(verifyAppId)
-        ) {
+        // Log EVERY message in the verify channel (any author) so we can see if the
+        // embed ever arrives from any source — webhook, follow-up, different id, etc.
+        if (d && String(d.channel_id) === String(roverChannelId)) {
           const n = Array.isArray(d.embeds) ? d.embeds.length : 0;
-          console.log(`  → [raw ${packet.t === "MESSAGE_CREATE" ? "MC" : "MU"}] id=${d.id} embeds=${n}`);
+          const kind = packet.t === "MESSAGE_CREATE" ? "MC" : "MU";
+          console.log(
+            `  → [raw ${kind}] id=${d.id} author=${d.author?.id ?? "?"} bot=${d.author?.bot ?? "?"} embeds=${n} flags=${d.flags ?? 0} content="${String(d.content || "").slice(0, 40)}"`
+          );
           if (n > 0) {
-            // Match the deferred message id; if a follow-up arrived under a new id and
-            // there's exactly one outstanding request, deliver to it.
+            // Deliver to the matching waiter by id; otherwise, if there's exactly one
+            // outstanding request, deliver to it (covers follow-ups under a new id).
             if (!deliverSlashEmbeds(d.id, d.embeds) && slashWaiters.size === 1) {
               const [mid] = slashWaiters.keys();
               deliverSlashEmbeds(mid, d.embeds);
