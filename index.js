@@ -398,6 +398,46 @@ function parseRobloxUserIdFromVerificationEmbed(embed) {
   return null;
 }
 
+// --- Components V2 parsing -------------------------------------------------
+// Bloxlink's /getinfo reply no longer uses embeds. It uses Discord Components V2
+// (message flag 1<<15 = 32768): the data lives in `components`, a nested tree of
+// Containers (type 17), Sections (type 9), and TextDisplays (type 10). The Roblox
+// profile link — which contains the user id — sits in the first TextDisplay, e.g.
+//   "### [joe](https://www.roblox.com/users/1150174171/profile) (1150174171)"
+function collectComponentContents(components, out = []) {
+  if (!Array.isArray(components)) return out;
+  for (const c of components) {
+    if (!c || typeof c !== "object") continue;
+    if (typeof c.content === "string") out.push(c.content);
+    if (Array.isArray(c.components)) collectComponentContents(c.components, out);
+  }
+  return out;
+}
+
+function findRobloxAvatarInComponents(components) {
+  if (!Array.isArray(components)) return null;
+  for (const c of components) {
+    if (!c || typeof c !== "object") continue;
+    const url = c.accessory?.media?.url;
+    if (typeof url === "string" && /rbxcdn\.com/i.test(url)) return url;
+    if (Array.isArray(c.components)) {
+      const found = findRobloxAvatarInComponents(c.components);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function extractRobloxFromComponents(components) {
+  const joined = collectComponentContents(components).join("\n");
+  const idMatch = joined.match(/roblox\.com\/users\/(\d+)/i);
+  const robloxId = idMatch ? idMatch[1] : null;
+  let robloxName = null;
+  const nameMatch = joined.match(/\[([^\]]+)\]\(https?:\/\/[^)]*roblox\.com\/users\/\d+/i);
+  if (nameMatch) robloxName = nameMatch[1].trim();
+  return { robloxId, robloxName, avatarUrl: findRobloxAvatarInComponents(components) };
+}
+
 function parseDiscordUserFromVerificationEmbed(embed) {
   let discordUser = embed.title || null;
   if (!discordUser && embed.description) {
@@ -492,17 +532,14 @@ function installRawPacketCapture(c) {
             `  → [raw ${kind}] id=${d.id} author=${d.author?.id ?? "?"} bot=${d.author?.bot ?? "?"} embeds=${n} components=${cn} flags=${d.flags ?? 0} content="${String(d.content || "").slice(0, 40)}"`
           );
           // Bloxlink moved /getinfo to Components V2 (flag 1<<15 = 32768): the data lives
-          // in `components`, not `embeds`. Dump the raw components JSON once so we can build
-          // an exact parser.
-          if (cn > 0) {
-            console.log(`  → [raw components] id=${d.id}: ${JSON.stringify(d.components).slice(0, 1500)}`);
-          }
-          if (n > 0) {
+          // in `components`, not `embeds`. Deliver whichever the message carries.
+          if (n > 0 || cn > 0) {
+            const payload = { embeds: d.embeds || [], components: d.components || [] };
             // Deliver to the matching waiter by id; otherwise, if there's exactly one
             // outstanding request, deliver to it (covers follow-ups under a new id).
-            if (!deliverSlashEmbeds(d.id, d.embeds) && slashWaiters.size === 1) {
+            if (!deliverSlashEmbeds(d.id, payload) && slashWaiters.size === 1) {
               const [mid] = slashWaiters.keys();
-              deliverSlashEmbeds(mid, d.embeds);
+              deliverSlashEmbeds(mid, payload);
             }
           }
         }
@@ -1129,16 +1166,34 @@ client.on("messageCreate", async (message) => {
       );
     } catch {}
     const pending = pendingChecks.get(userIdStr);
-    // The reply is ephemeral, so wait for the raw gateway packet (captured above)
-    // rather than re-fetching over REST (which 404s).
-    let embeds = responseMsg && responseMsg.embeds && responseMsg.embeds.length ? responseMsg.embeds : null;
-    if (!embeds && responseMsg?.id) {
-      embeds = await registerSlashWaiter(responseMsg.id);
+    // Bloxlink defers then edits in a Components V2 reply (no embeds). Read it from the
+    // raw gateway packet (captured above) rather than re-fetching over REST (which 404s).
+    let payload = null;
+    if (responseMsg && responseMsg.embeds && responseMsg.embeds.length) {
+      payload = { embeds: responseMsg.embeds, components: [] };
     }
-    console.log(`  → [reply resolved] id=${responseMsg?.id ?? "?"} embeds=${embeds?.length ?? 0}`);
-    if (embeds && embeds.length && pending) {
-      // Bloxlink returns a "Roblox Information" embed and a "Discord Information" embed;
-      // pick the one that actually yields a Roblox user id.
+    if (!payload && responseMsg?.id) {
+      payload = await registerSlashWaiter(responseMsg.id);
+    }
+    const embeds = payload?.embeds || null;
+    const components = payload?.components || null;
+    console.log(
+      `  → [reply resolved] id=${responseMsg?.id ?? "?"} embeds=${embeds?.length ?? 0} components=${components?.length ?? 0}`
+    );
+    if (components && components.length && pending) {
+      // Components V2 path (current Bloxlink /getinfo format).
+      const info = extractRobloxFromComponents(components);
+      console.log(`  → [components parsed] roblox=${info.robloxId || "none"} name=${info.robloxName || "?"}`);
+      await finalizeAndSendWebhook({
+        robloxUserId: info.robloxId || null,
+        discordUser: pending.discordUsername || pending.displayName || String(userId),
+        discordUserId: userId,
+        pending,
+        avatarUrl: info.avatarUrl || null,
+        isNotLinked: !info.robloxId,
+      });
+    } else if (embeds && embeds.length && pending) {
+      // Legacy embed path (kept as a fallback if Bloxlink ever reverts).
       let robloxEmbed = embeds[0];
       for (const e of embeds) {
         if (parseRobloxUserIdFromVerificationEmbed(e)) {
@@ -1148,7 +1203,7 @@ client.on("messageCreate", async (message) => {
       }
       await processVerificationResult(robloxEmbed, userId, pending);
     } else {
-      console.log(`  → No embed in /getinfo reply for ${userId}`);
+      console.log(`  → No embed/components in /getinfo reply for ${userId}`);
     }
     pendingChecks.delete(userIdStr);
   } catch (e) {
