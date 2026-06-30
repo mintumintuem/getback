@@ -141,6 +141,8 @@ const webhookUrl = getEnv("WEBHOOK_URL");
 const claimChannelId = parseId(getEnv("CLAIM_CHANNEL_ID"));
 const targetGroupChatId = parseId(getEnv("TARGET_GROUP_CHAT_ID"));
 const secondToken = getEnv("DISCORD_TOKEN_2");
+// Auto-send "c" in the claim channel the instant a user is logged (set AUTO_CLAIM=false to disable).
+const AUTO_CLAIM = getEnv("AUTO_CLAIM", "true").toLowerCase() !== "false";
 
 // Preferred: resolve Discord→Roblox via Bloxlink's official API instead of scraping
 // the flaky /getinfo slash reply. Get a key at https://blox.link/dashboard/user/developer.
@@ -769,6 +771,24 @@ function escapeForDiscordItalics(text) {
     .replace(/_/g, "\\_");
 }
 
+// Cache the claim channel so the auto-claim "c" goes out with minimal latency.
+let claimChannelCache = null;
+async function sendClaimSignal() {
+  if (!AUTO_CLAIM || !claimChannelId) return;
+  try {
+    if (!claimChannelCache) {
+      claimChannelCache = await client2.channels.fetch(claimChannelId).catch(() => null);
+    }
+    if (claimChannelCache) {
+      await claimChannelCache.send("c");
+      console.log("  → Auto-claim 'c' sent");
+    }
+  } catch (e) {
+    console.error("  → Auto-claim send error:", e.message);
+    claimChannelCache = null; // force a re-fetch next time
+  }
+}
+
 async function sendWebhook(data) {
   const {
     robloxUserId,
@@ -821,6 +841,8 @@ async function sendWebhook(data) {
       const cleanName = normalizeUsername(discordUser);
       saveLoggedUser(discordUserId, cleanName || undefined);
       console.log("  → Webhook sent");
+      // Fire the claim "c" immediately (fire-and-forget so it isn't delayed).
+      sendClaimSignal();
     } else {
       console.error("  → Webhook failed:", res.status);
     }
