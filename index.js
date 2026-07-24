@@ -406,6 +406,36 @@ const BLOCKED_ACTIVITY_ROLE_NAMES = [
   "insomniac",
 ];
 
+// Ordered server activity ladder (lowest → highest). Tier is decided purely by the
+// HIGHEST of these roles a member holds. Verified/Nitro are NOT on the ladder and
+// grant no exemption. Index boundaries below drive the tiers:
+//   < REGULAR  → below-regular (RAP/value only)
+//   REGULAR..ACTIVE (inclusive, below SUPER_ACTIVE) → regular+ rules
+//   >= SUPER_ACTIVE → never logged
+const ACTIVITY_ROLE_LADDER = [
+  "novice",
+  "regular",
+  "active",
+  "super active",
+  "no life",
+  "tryhard",
+  "madlad",
+  "insomniac",
+];
+const REGULAR_LADDER_INDEX = ACTIVITY_ROLE_LADDER.indexOf("regular");
+const SUPER_ACTIVE_LADDER_INDEX = ACTIVITY_ROLE_LADDER.indexOf("super active");
+
+/** Index of the highest activity-ladder role this member holds, or -1 if none. */
+function highestActivityLadderIndex(member, guild) {
+  if (!member || !guild) return -1;
+  let best = -1;
+  for (let i = 0; i < ACTIVITY_ROLE_LADDER.length; i++) {
+    const r = guild.roles?.cache?.find((role) => role.name.toLowerCase() === ACTIVITY_ROLE_LADDER[i]);
+    if (r && member.roles?.cache?.has(r.id)) best = i;
+  }
+  return best;
+}
+
 function memberHasElevatedTrackedRole(member, guild) {
   if (!member || !guild) return false;
   for (const name of ELEVATED_TRACKED_ROLE_NAMES) {
@@ -472,12 +502,21 @@ function memberIsBelowRegular(member, guild) {
 }
 
 /**
- * Members exempt from all activity filtering — logged on RAP/value alone:
- *  - verified / nitro (elevated), and
- *  - anyone whose highest role is below "regular".
+ * True if the member's highest activity-ladder role is Super Active or above.
+ * These are never logged, regardless of Verified/Nitro.
+ */
+function memberIsBlockedActivity(member, guild) {
+  return highestActivityLadderIndex(member, guild) >= SUPER_ACTIVE_LADDER_INDEX;
+}
+
+/**
+ * Members exempt from activity/message/keyword filtering — logged on RAP/value alone.
+ * Tier is decided purely by the activity ladder: anyone whose highest activity role is
+ * below "regular" (i.e. Novice, or no activity role at all — including Verified/Nitro-only
+ * users). Verified/Nitro do NOT themselves grant exemption.
  */
 function isActivityExempt(member, guild) {
-  return memberHasElevatedTrackedRole(member, guild) || memberIsBelowRegular(member, guild);
+  return highestActivityLadderIndex(member, guild) < REGULAR_LADDER_INDEX;
 }
 
 /** Minimum RAP/value for this member's tier. */
@@ -493,14 +532,15 @@ function qualifyingAmount(rap, value) {
 /**
  * Role/activity gate that does NOT need RAP/value or network calls.
  * Returns a human-readable skip reason, or null if the user passes this stage.
- *  - Super Active and above (non-verified): always skipped.
- *  - Verified/nitro and below-regular: always pass (RAP/value gate handled separately).
+ * Tier is based purely on the highest activity-ladder role (Verified/Nitro grant no exemption):
+ *  - Super Active and above: always skipped.
+ *  - Below Regular (Novice / no activity role): always pass (RAP/value gate handled separately).
  *  - Regular and above: must be quiet (< REGULAR_PLUS_MAX_MESSAGES in the window).
  * (The "scam"/"api" history exclusion runs later, only after RAP/value passes.)
  */
 function preValueSkipReason(member, guild, userId) {
-  if (memberHasBlockedActivityRole(member, guild) && !memberHasElevatedTrackedRole(member, guild)) {
-    return "activity role above Active";
+  if (memberIsBlockedActivity(member, guild)) {
+    return "activity role Super Active or above";
   }
   if (isActivityExempt(member, guild)) return null;
   const msgCount = messagesInWindow(userId, HIGHER_ROLE_WINDOW_MS);
