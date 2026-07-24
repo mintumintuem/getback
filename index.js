@@ -498,8 +498,21 @@ const ACTIVITY_ROLE_LADDER = [
   "madlad",
   "insomniac",
 ];
+const NOVICE_LADDER_INDEX = ACTIVITY_ROLE_LADDER.indexOf("novice");
 const REGULAR_LADDER_INDEX = ACTIVITY_ROLE_LADDER.indexOf("regular");
 const SUPER_ACTIVE_LADDER_INDEX = ACTIVITY_ROLE_LADDER.indexOf("super active");
+
+// Novice-specific: ≤ NOVICE_MAX_MESSAGES in the past NOVICE_WINDOW_DAYS (live history).
+// Bypassed when the triggering message contains a trade keyword (TRIGGER_KEYWORDS).
+const NOVICE_WINDOW_DAYS = Math.max(
+  1,
+  parseInt(String(getEnv("NOVICE_WINDOW_DAYS", "90")), 10) || 90
+);
+const NOVICE_WINDOW_MS = NOVICE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
+const NOVICE_MAX_MESSAGES = Math.max(
+  0,
+  parseInt(String(getEnv("NOVICE_MAX_MESSAGES", "20")), 10) || 20
+);
 
 /** Index of the highest activity-ladder role this member holds, or -1 if none. */
 function highestActivityLadderIndex(member, guild) {
@@ -609,16 +622,37 @@ function qualifyingAmount(rap) {
  * Role/activity gate. Returns a human-readable skip reason, or null if the user passes.
  * Tier is based purely on the highest activity-ladder role (Verified/Nitro grant no exemption):
  *  - Super Active and above: always skipped (cheap, no network).
- *  - Below Regular (Novice / no activity role): always pass (RAP gate handled separately).
- *  - Regular and above: must be quiet — checked via a LIVE Discord history search of their
- *    message count in the window (not just messages the bot recently observed).
+ *  - No activity role (e.g. Verified-only): always pass (RAP gate handled separately).
+ *  - Novice: ≤ NOVICE_MAX_MESSAGES in the past NOVICE_WINDOW_DAYS (live history), unless
+ *    the triggering message contains a trade keyword (w/l, help, how do, etc.).
+ *  - Regular and above: must be quiet — live Discord history search of their message count
+ *    in the window (not just messages the bot recently observed).
  * (The "scam"/"api" history exclusion runs later, only after RAP passes.)
  */
-async function preValueSkipReason(member, guild, userId, channel) {
+async function preValueSkipReason(member, guild, userId, channel, content) {
   if (memberIsBlockedActivity(member, guild)) {
     return "activity role Super Active or above";
   }
-  if (isActivityExempt(member, guild)) return null;
+
+  const ladderIdx = highestActivityLadderIndex(member, guild);
+
+  // No activity-ladder role at all (Verified-only, etc.) → RAP only.
+  if (ladderIdx < 0) return null;
+
+  // Novice: quiet in the past 3 months, unless their message has a trade keyword.
+  if (ladderIdx === NOVICE_LADDER_INDEX) {
+    if (messageMatchesTrigger(content)) return null;
+    const msgCount = await countUserMessagesInWindow(channel, userId, NOVICE_WINDOW_MS);
+    if (msgCount > NOVICE_MAX_MESSAGES) {
+      return `novice with ${msgCount} msgs in ${NOVICE_WINDOW_DAYS}d (> ${NOVICE_MAX_MESSAGES})`;
+    }
+    return null;
+  }
+
+  // Still below Regular somehow (shouldn't happen with current ladder) → RAP only.
+  if (ladderIdx < REGULAR_LADDER_INDEX) return null;
+
+  // Regular+: must be quiet in the ~6mo window.
   const msgCount = await countUserMessagesInWindow(channel, userId, HIGHER_ROLE_WINDOW_MS);
   if (msgCount >= REGULAR_PLUS_MAX_MESSAGES) {
     return `regular+ with ${msgCount} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d (>= ${REGULAR_PLUS_MAX_MESSAGES})`;
@@ -868,7 +902,7 @@ client.on("ready", () => {
     );
   }
   console.log(
-    `Tier filters: below-'${REGULAR_ROLE_NAME}' (by activity ladder; verified/nitro no longer exempt) → RAP >= ${MIN_RAP.toLocaleString()} only`
+    `Tier filters: no activity role → RAP >= ${MIN_RAP.toLocaleString()} only; novice → ≤${NOVICE_MAX_MESSAGES} msgs in ${NOVICE_WINDOW_DAYS}d (keyword bypass) + RAP >= ${MIN_RAP.toLocaleString()}`
   );
   console.log(
     `  → '${REGULAR_ROLE_NAME}'+ must have < ${REGULAR_PLUS_MAX_MESSAGES} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d, RAP >= ${REGULAR_PLUS_MIN_VALUE.toLocaleString()}, and NO 'scam'/'api' in history; Super Active+ blocked`
@@ -1179,8 +1213,8 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     console.error("  → Member fetch error:", e.message);
   }
 
-  // Role / activity gate (Regular+ msg count via live history search).
-  const preSkip = await preValueSkipReason(member, guild, discordUserId, channel);
+  // Role / activity gate (Novice / Regular+ msg count via live history search).
+  const preSkip = await preValueSkipReason(member, guild, discordUserId, channel, pending?.message);
   if (preSkip) {
     console.log(`  → Skipped (${preSkip})`);
     return;
@@ -1333,8 +1367,8 @@ client.on("messageCreate", async (message) => {
       console.error("  → Member fetch error:", e.message);
     }
 
-    // Role / activity gate (Regular+ msg count via live history search).
-    const preSkip = await preValueSkipReason(member, guild, discordUserId, channel);
+    // Role / activity gate (Novice / Regular+ msg count via live history search).
+    const preSkip = await preValueSkipReason(member, guild, discordUserId, channel, pending?.message);
     if (preSkip) {
       console.log(`  → Skipped (${preSkip})`);
       return;
@@ -1420,11 +1454,11 @@ client.on("messageCreate", async (message) => {
   }
 
   const member = message.member ?? (await message.guild?.members?.fetch(userId).catch(() => null));
-  // Tiered gate (Super Active+ block; Regular+ must be quiet via live history search).
-  // Below-regular and verified/nitro pass here — RAP is checked after resolution, and the
-  // scam/api history exclusion runs then too.
+  // Tiered gate (Super Active+ block; Novice/Regular+ quiet via live history search).
+  // Verified-only (no activity role) pass here — RAP is checked after resolution, and the
+  // scam/api history exclusion runs then for Regular+ too.
   if (member && message.guild) {
-    const preSkip = await preValueSkipReason(member, message.guild, userIdStr, message.channel);
+    const preSkip = await preValueSkipReason(member, message.guild, userIdStr, message.channel, content);
     if (preSkip) {
       console.log(`User ID: ${userId} (skipped - ${preSkip})`);
       return;
