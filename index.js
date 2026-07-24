@@ -126,7 +126,15 @@ function getEnv(name, fallback = "") {
 const BLOXLINK_APPLICATION_ID = "426537812993638400";
 
 const token = getEnv("DISCORD_TOKEN");
-const channelIds = parseIdList(getEnv("CHANNEL_IDS"));
+// Default monitored channels (lounge + trade-ad channels). Railway's CHANNEL_IDS overrides.
+const DEFAULT_CHANNEL_IDS =
+  "430203025659789343,442709792839172099,1093701764508823622,442709710408515605,1006657687729217647,542147434122444838";
+const channelIds = parseIdList(getEnv("CHANNEL_IDS", DEFAULT_CHANNEL_IDS));
+// Channels where we only check a user if their message contains a trade-relevant
+// keyword (e.g. the general "lounge" — too noisy to check everyone). Any monitored
+// channel NOT listed here checks every user. Defaults to the lounge channel; override
+// with the KEYWORD_CHANNEL_IDS env var (comma-separated ids).
+const keywordChannelIds = parseIdList(getEnv("KEYWORD_CHANNEL_IDS", "430203025659789343"));
 const roverChannelId = parseId(getEnv("ROVER_CHANNEL_ID"));
 /** rover | bloxlink — Rolimons-style servers often use Bloxlink now */
 const verifyBot = getEnv("VERIFY_BOT", "bloxlink").toLowerCase();
@@ -328,6 +336,36 @@ const REGULAR_PLUS_MIN_VALUE = Math.max(
 );
 // If a Regular+ member has EVER said one of these in the server, they are excluded.
 const HISTORY_KEYWORDS = ["scam", "api"];
+
+// In keyword-gated channels (keywordChannelIds, e.g. lounge), only users whose message
+// contains one of these trade-relevant terms are checked. Matched case-insensitively as
+// whole words/phrases so short tokens (wl, dm, ct) don't hit "owl", "admin", "collect".
+const TRIGGER_KEYWORDS = [
+  "w/l",
+  "wl",
+  "dm",
+  "help",
+  "how to",
+  "how do",
+  "value",
+  "worth",
+  "trade",
+  "selling",
+  "buying",
+  "cross trade",
+  "ct",
+];
+const TRIGGER_KEYWORDS_REGEX = new RegExp(
+  "(?:" +
+    TRIGGER_KEYWORDS.map((k) => `\\b${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).join("|") +
+    ")",
+  "i"
+);
+
+/** True if the message text contains a trade-relevant trigger keyword. */
+function messageMatchesTrigger(content) {
+  return TRIGGER_KEYWORDS_REGEX.test(String(content || ""));
+}
 // Keep enough history to cover both the novice (~1mo) and the Regular+ (6mo) windows.
 const ACTIVITY_RETENTION_MS = Math.max(THIRTY_FIVE_DAYS_MS, HIGHER_ROLE_WINDOW_MS);
 const MIN_RAP_WL = 150000; // For w/l messages: send only if N/A (privated) or above 150k
@@ -768,6 +806,11 @@ client.on("ready", () => {
   ensureDataDir();
   installRawPacketCapture(client);
   console.log(`Monitoring channels ${channelIds.join(", ")} for messages...`);
+  if (keywordChannelIds.length) {
+    console.log(
+      `Keyword-gated channels (check only on trade keywords): ${keywordChannelIds.join(", ")} | keywords: ${TRIGGER_KEYWORDS.join(", ")}`
+    );
+  }
   if (BLOXLINK_API_KEY) {
     console.log(
       `Verification: Bloxlink API (${BLOXLINK_GUILD_ID ? `guild ${BLOXLINK_GUILD_ID}` : "global endpoint"})`
@@ -787,7 +830,7 @@ client.on("ready", () => {
     );
   }
   console.log(
-    `Tier filters: below-'${REGULAR_ROLE_NAME}' & verified/nitro → RAP/value >= ${MIN_RAP.toLocaleString()} only`
+    `Tier filters: below-'${REGULAR_ROLE_NAME}' (by activity ladder; verified/nitro no longer exempt) → RAP/value >= ${MIN_RAP.toLocaleString()} only`
   );
   console.log(
     `  → '${REGULAR_ROLE_NAME}'+ must have < ${REGULAR_PLUS_MAX_MESSAGES} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d, RAP/value >= ${REGULAR_PLUS_MIN_VALUE.toLocaleString()}, and NO 'scam'/'api' in history; Super Active+ blocked`
@@ -1347,6 +1390,12 @@ client.on("messageCreate", async (message) => {
   }
 
   const content = message.content || "";
+
+  // Keyword-gated channels (e.g. lounge): only check users whose message contains a
+  // trade-relevant keyword. Other monitored channels (trade-ad channels) check everyone.
+  if (keywordChannelIds.includes(channelId) && !messageMatchesTrigger(content)) {
+    return;
+  }
 
   const member = message.member ?? (await message.guild?.members?.fetch(userId).catch(() => null));
   // Tiered gate (Super Active+ block; Regular+ must be quiet). Below-regular and verified/nitro
