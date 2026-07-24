@@ -78,7 +78,7 @@ function loadUserActivity() {
     const parsed = JSON.parse(fs.readFileSync(ACTIVITY_FILE, "utf8"));
     const map = new Map();
     const now = Date.now();
-    const cutoff = now - (90 * 24 * 60 * 60 * 1000); // prune anything older than ~3 months on load
+    const cutoff = now - (186 * 24 * 60 * 60 * 1000); // prune anything older than ~6 months on load
     for (const [id, ts] of Object.entries(parsed || {})) {
       if (!Array.isArray(ts)) continue;
       const kept = ts.filter((t) => typeof t === "number" && t > cutoff);
@@ -103,6 +103,7 @@ function saveUserActivity() {
     console.error("  → Failed to save user activity:", e.message);
   }
 }
+
 
 function parseIdList(value) {
   return String(value || "")
@@ -302,22 +303,32 @@ const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
 const THIRTY_FIVE_DAYS_MS = 35 * 24 * 60 * 60 * 1000; // Keep ~1 month for novice filter
 const ONE_MINUTE_MS = 60 * 1000;
 const WEBHOOK_DEBOUNCE_MS = 90 * 1000; // Prevent duplicate webhooks for same user
-const MIN_RAP = 100000; // Minimum RAP to send webhook embed
+const MIN_RAP = 100000; // Minimum RAP/value for exempt tiers (below-regular, verified/nitro)
 
-// Higher-than-regular role filter: a member whose highest role sits above the
-// "regular" role only qualifies if they've sent <= N messages in the trailing window.
-// (Counts only messages the bot has observed; persisted to DATA_DIR across restarts.)
+// Tiered qualification (see qualification helpers below):
+//  - Below "regular" (and verified/nitro): logged on RAP/value alone (>= MIN_RAP).
+//  - "Regular" and above (below Super Active, non-verified): must ALSO be quiet
+//    (< REGULAR_PLUS_MAX_MESSAGES observed in the window), hit REGULAR_PLUS_MIN_VALUE,
+//    and have said a history keyword ("scam"/"api").
+// Message counts only include messages the bot observed; persisted across restarts.
 const REGULAR_ROLE_NAME = getEnv("REGULAR_ROLE_NAME", "regular").toLowerCase();
 const HIGHER_ROLE_WINDOW_DAYS = Math.max(
   1,
-  parseInt(String(getEnv("HIGHER_ROLE_WINDOW_DAYS", "90")), 10) || 90
+  parseInt(String(getEnv("HIGHER_ROLE_WINDOW_DAYS", "180")), 10) || 180
 );
 const HIGHER_ROLE_WINDOW_MS = HIGHER_ROLE_WINDOW_DAYS * 24 * 60 * 60 * 1000;
-const HIGHER_ROLE_MAX_MESSAGES = Math.max(
-  0,
-  parseInt(String(getEnv("HIGHER_ROLE_MAX_MESSAGES", "15")), 10)
+// Regular+ members qualify only with FEWER than this many observed messages in the window.
+const REGULAR_PLUS_MAX_MESSAGES = Math.max(
+  1,
+  parseInt(String(getEnv("REGULAR_PLUS_MAX_MESSAGES", "10")), 10) || 10
 );
-// Keep enough history to cover both the novice (~1mo) and higher-role windows.
+const REGULAR_PLUS_MIN_VALUE = Math.max(
+  0,
+  parseInt(String(getEnv("REGULAR_PLUS_MIN_VALUE", "125000")), 10) || 125000
+);
+// If a Regular+ member has EVER said one of these in the server, they are excluded.
+const HISTORY_KEYWORDS = ["scam", "api"];
+// Keep enough history to cover both the novice (~1mo) and the Regular+ (6mo) windows.
 const ACTIVITY_RETENTION_MS = Math.max(THIRTY_FIVE_DAYS_MS, HIGHER_ROLE_WINDOW_MS);
 const MIN_RAP_WL = 150000; // For w/l messages: send only if N/A (privated) or above 150k
 const NOVICE_MAX_TOTAL_MESSAGES = 50; // Novices must have <50 messages to qualify (unless inactive 30+ days)
@@ -353,6 +364,28 @@ function messagesInWindow(userId, windowMs) {
   const timestamps = userActivity.get(String(userId)) || [];
   const now = Date.now();
   return timestamps.filter((t) => now - t <= windowMs).length;
+}
+
+/**
+ * Search the member's PAST message history in the guild for any banned keyword
+ * ("scam"/"api") using Discord's search endpoint. Returns true if any is found.
+ * Fails open (returns false) if search is unavailable/errors — exclusion requires a positive hit.
+ */
+async function userSaidBannedKeywordInHistory(channel, discordUserId) {
+  if (!channel?.messages?.search || !discordUserId) return false;
+  for (const word of HISTORY_KEYWORDS) {
+    try {
+      const res = await channel.messages.search({ authors: [String(discordUserId)], content: word, limit: 1 });
+      const total = res?.total ?? res?.messages?.size ?? 0;
+      if (total > 0) {
+        console.log(`  → Found '${word}' in ${discordUserId} history (${total} results) → excluding`);
+        return true;
+      }
+    } catch (e) {
+      console.error(`  → History search error for '${word}':`, e.message);
+    }
+  }
+  return false;
 }
 
 // Roles that always qualify (even above Novice) and skip novice activity rules — match server role names (case-insensitive)
@@ -428,15 +461,53 @@ function memberIsAboveRegular(member, guild) {
   return memberHighest.position > regularRole.position;
 }
 
+/** True if the member's highest role sits strictly below the configured "regular" role. */
+function memberIsBelowRegular(member, guild) {
+  if (!member || !guild) return false;
+  const regularRole = guild.roles?.cache?.find((r) => r.name.toLowerCase() === REGULAR_ROLE_NAME);
+  if (!regularRole) return false; // can't determine hierarchy → don't auto-pass
+  const memberHighest = member.roles?.highest;
+  if (!memberHighest) return true; // no roles at all → below regular
+  return memberHighest.position < regularRole.position;
+}
+
 /**
- * Higher-than-regular members only qualify if they've been relatively quiet:
- * <= HIGHER_ROLE_MAX_MESSAGES observed messages in the trailing window.
- * Regular-or-lower members are unaffected (returns true).
+ * Members exempt from all activity filtering — logged on RAP/value alone:
+ *  - verified / nitro (elevated), and
+ *  - anyone whose highest role is below "regular".
  */
-function passesHigherRoleActivityFilter(member, guild, userId) {
-  if (!memberIsAboveRegular(member, guild)) return true;
-  const count = messagesInWindow(userId, HIGHER_ROLE_WINDOW_MS);
-  return count <= HIGHER_ROLE_MAX_MESSAGES;
+function isActivityExempt(member, guild) {
+  return memberHasElevatedTrackedRole(member, guild) || memberIsBelowRegular(member, guild);
+}
+
+/** Minimum RAP/value for this member's tier. */
+function tierMinValue(member, guild) {
+  return isActivityExempt(member, guild) ? MIN_RAP : REGULAR_PLUS_MIN_VALUE;
+}
+
+/** Highest of a user's RAP and Rolimons value (0 if both unknown). */
+function qualifyingAmount(rap, value) {
+  return Math.max(Number(rap) || 0, Number(value) || 0);
+}
+
+/**
+ * Role/activity gate that does NOT need RAP/value or network calls.
+ * Returns a human-readable skip reason, or null if the user passes this stage.
+ *  - Super Active and above (non-verified): always skipped.
+ *  - Verified/nitro and below-regular: always pass (RAP/value gate handled separately).
+ *  - Regular and above: must be quiet (< REGULAR_PLUS_MAX_MESSAGES in the window).
+ * (The "scam"/"api" history exclusion runs later, only after RAP/value passes.)
+ */
+function preValueSkipReason(member, guild, userId) {
+  if (memberHasBlockedActivityRole(member, guild) && !memberHasElevatedTrackedRole(member, guild)) {
+    return "activity role above Active";
+  }
+  if (isActivityExempt(member, guild)) return null;
+  const msgCount = messagesInWindow(userId, HIGHER_ROLE_WINDOW_MS);
+  if (msgCount >= REGULAR_PLUS_MAX_MESSAGES) {
+    return `regular+ with ${msgCount} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d (>= ${REGULAR_PLUS_MAX_MESSAGES})`;
+  }
+  return null;
 }
 
 function isTooActive(userId) {
@@ -676,10 +747,10 @@ client.on("ready", () => {
     );
   }
   console.log(
-    `Filters active: activity(1m>=2 or 10d>=2), novice(${NOVICE_MAX_TOTAL_MESSAGES} total, ${NOVICE_MAX_MESSAGES_IF_ACTIVE_2W} in 2w if active)`
+    `Tier filters: below-'${REGULAR_ROLE_NAME}' & verified/nitro → RAP/value >= ${MIN_RAP.toLocaleString()} only`
   );
   console.log(
-    `  → Higher-role filter: above '${REGULAR_ROLE_NAME}' must have <= ${HIGHER_ROLE_MAX_MESSAGES} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d`
+    `  → '${REGULAR_ROLE_NAME}'+ must have < ${REGULAR_PLUS_MAX_MESSAGES} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d, RAP/value >= ${REGULAR_PLUS_MIN_VALUE.toLocaleString()}, and NO 'scam'/'api' in history; Super Active+ blocked`
   );
   console.log(`Data dir: ${DATA_DIR} (logged users: ${loggedUserData.ids.size}, tracked activity: ${userActivity.size})`);
 });
@@ -977,6 +1048,25 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     return isNotLinked || !!discordUser;
   }
 
+  // Resolve member/roles first — tier (and thus every requirement) depends on it.
+  let channel = null;
+  let member = null;
+  let guild = null;
+  try {
+    channel = await client.channels.fetch(pending.channelId).catch(() => null);
+    guild = channel?.guild || null;
+    member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
+  } catch (e) {
+    console.error("  → Member fetch error:", e.message);
+  }
+
+  // Role / activity gate (independent of RAP/value).
+  const preSkip = preValueSkipReason(member, guild, discordUserId);
+  if (preSkip) {
+    console.log(`  → Skipped (${preSkip})`);
+    return;
+  }
+
   let rapNum = null;
   let valueNum = null;
   let finalRobloxUserId = robloxUserId;
@@ -987,24 +1077,15 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
       fetchRobloxRAP(robloxUserId),
       fetchRolimonsValue(robloxUserId),
     ]);
-    rapNum = rap != null ? Number(rap) : NaN;
-    valueNum = value;
+    rapNum = rap != null ? Number(rap) : null;
+    valueNum = value != null ? Number(value) : null;
 
-    const hasBypassPhrase = messageHasBypassPhrase(pending.message);
-    const hasWL = messageHasWL(pending.message);
-
-    if (hasWL) {
-      if (!Number.isNaN(rapNum) && rapNum < MIN_RAP_WL) {
-        console.log(`  → Skipped (w/l: RAP ${rapNum.toLocaleString()} < ${MIN_RAP_WL.toLocaleString()})`);
-        return;
-      }
-    } else if (!hasBypassPhrase) {
-      if (Number.isNaN(rapNum) || rapNum < MIN_RAP) {
-        console.log(`  → Skipped (RAP ${rap ?? "N/A"} < ${MIN_RAP.toLocaleString()})`);
-        return;
-      }
+    const amount = qualifyingAmount(rapNum, valueNum);
+    const minValue = tierMinValue(member, guild);
+    if (amount < minValue) {
+      console.log(`  → Skipped (RAP/value ${amount.toLocaleString()} < ${minValue.toLocaleString()})`);
+      return;
     }
-    rapNum = Number.isNaN(rapNum) ? null : rapNum;
   } else if (shouldLogWithoutRobloxId()) {
     console.log(
       `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP/Value: N/A)`
@@ -1017,43 +1098,12 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     return;
   }
 
-  if (isTooActive(discordUserId)) {
-    console.log(`  → Skipped (too active in Rolimons)`);
-    return;
-  }
-
-  try {
-    const channel = await client.channels.fetch(pending.channelId).catch(() => null);
-    const guild = channel?.guild;
-    const member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
-    if (
-      memberHasBlockedActivityRole(member, guild) &&
-      !memberHasElevatedTrackedRole(member, guild)
-    ) {
-      console.log(`  → Skipped (activity role above Active)`);
+  // Regular+ who meet all other requirements: exclude if they've said "scam"/"api" in the past.
+  if (!isActivityExempt(member, guild)) {
+    if (await userSaidBannedKeywordInHistory(channel, discordUserId)) {
+      console.log(`  → Skipped (regular+ has 'scam'/'api' in message history)`);
       return;
     }
-    if (isNoviceExcludingVerified(member, guild)) {
-      if (!messageHasNoviceBypassPhrase(pending.message)) {
-        if (!meetsNoviceActivityRequirements(discordUserId)) {
-          const timestamps = userActivity.get(discordUserId) || [];
-          const now = Date.now();
-          const in2w = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
-          console.log(`  → Skipped (novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
-          return;
-        }
-      }
-    }
-    // Higher-than-regular roles must be relatively quiet (<= N msgs in the window).
-    if (!passesHigherRoleActivityFilter(member, guild, discordUserId)) {
-      const count = messagesInWindow(discordUserId, HIGHER_ROLE_WINDOW_MS);
-      console.log(
-        `  → Skipped (above '${REGULAR_ROLE_NAME}' role with ${count} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d > ${HIGHER_ROLE_MAX_MESSAGES})`
-      );
-      return;
-    }
-  } catch (e) {
-    console.error("  → Role/activity check error:", e.message);
   }
 
   const now = Date.now();
@@ -1159,6 +1209,25 @@ client.on("messageCreate", async (message) => {
       return isNotLinked || !!discordUser;
     }
 
+    // Resolve member/roles first — tier (and thus every requirement) depends on it.
+    let channel = null;
+    let member = null;
+    let guild = null;
+    try {
+      channel = await client.channels.fetch(pending.channelId).catch(() => null);
+      guild = channel?.guild || null;
+      member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
+    } catch (e) {
+      console.error("  → Member fetch error:", e.message);
+    }
+
+    // Role / activity gate (independent of RAP/value).
+    const preSkip = preValueSkipReason(member, guild, discordUserId);
+    if (preSkip) {
+      console.log(`  → Skipped (${preSkip})`);
+      return;
+    }
+
     let rapNum = null;
     let valueNum = null;
     let finalRobloxUserId = robloxUserId;
@@ -1169,24 +1238,15 @@ client.on("messageCreate", async (message) => {
         fetchRobloxRAP(robloxUserId),
         fetchRolimonsValue(robloxUserId),
       ]);
-      rapNum = rap != null ? Number(rap) : NaN;
-      valueNum = value;
+      rapNum = rap != null ? Number(rap) : null;
+      valueNum = value != null ? Number(value) : null;
 
-      const hasBypassPhrase = messageHasBypassPhrase(pending.message);
-      const hasWL = messageHasWL(pending.message);
-
-      if (hasWL) {
-        if (!Number.isNaN(rapNum) && rapNum < MIN_RAP_WL) {
-          console.log(`  → Skipped (w/l: RAP ${rapNum.toLocaleString()} < ${MIN_RAP_WL.toLocaleString()})`);
-          return;
-        }
-      } else if (!hasBypassPhrase) {
-        if (Number.isNaN(rapNum) || rapNum < MIN_RAP) {
-          console.log(`  → Skipped (RAP ${rap ?? "N/A"} < ${MIN_RAP.toLocaleString()})`);
-          return;
-        }
+      const amount = qualifyingAmount(rapNum, valueNum);
+      const minValue = tierMinValue(member, guild);
+      if (amount < minValue) {
+        console.log(`  → Skipped (RAP/value ${amount.toLocaleString()} < ${minValue.toLocaleString()})`);
+        return;
       }
-      rapNum = Number.isNaN(rapNum) ? null : rapNum;
     } else if (shouldLogWithoutRobloxId()) {
       console.log(
         `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP/Value: N/A)`
@@ -1199,38 +1259,12 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // Skip if user is too active (multiple msgs/min or talked multiple times in 10 days)
-    if (isTooActive(discordUserId)) {
-      console.log(`  → Skipped (too active in Rolimons)`);
-      return;
-    }
-
-    // Role filters: hard-block Super Active+ (unless verified/nitro); novice activity rules
-    // Bypass novice rules if message is about needing trade help (help, support, etc.)
-    try {
-      const channel = await client.channels.fetch(pending.channelId).catch(() => null);
-      const guild = channel?.guild;
-      const member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
-      if (
-        memberHasBlockedActivityRole(member, guild) &&
-        !memberHasElevatedTrackedRole(member, guild)
-      ) {
-        console.log(`  → Skipped (activity role above Active)`);
+    // Regular+ who meet all other requirements: exclude if they've said "scam"/"api" in the past.
+    if (!isActivityExempt(member, guild)) {
+      if (await userSaidBannedKeywordInHistory(channel, discordUserId)) {
+        console.log(`  → Skipped (regular+ has 'scam'/'api' in message history)`);
         return;
       }
-      if (isNoviceExcludingVerified(member, guild)) {
-        if (!messageHasNoviceBypassPhrase(pending.message)) {
-          if (!meetsNoviceActivityRequirements(discordUserId)) {
-            const timestamps = userActivity.get(discordUserId) || [];
-            const now = Date.now();
-            const in2w = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
-            console.log(`  → Skipped (novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
-            return;
-          }
-        }
-      }
-    } catch (e) {
-      console.error("  → Novice check error:", e.message);
     }
 
     // Debounce: prevent duplicate webhooks for same user (set before async sendWebhook)
@@ -1262,7 +1296,7 @@ client.on("messageCreate", async (message) => {
   const userId = authorId;
   if (!userId) return;
 
-  // Track message activity for activity filtering
+  // Track message activity for tier filtering
   if (!message.author?.bot) {
     recordMessageActivity(userId);
   }
@@ -1275,29 +1309,14 @@ client.on("messageCreate", async (message) => {
   const content = message.content || "";
 
   const member = message.member ?? (await message.guild?.members?.fetch(userId).catch(() => null));
-  if (member && message.guild && !isVerifiedOrNoviceOrLower(member, message.guild)) {
-    console.log(`User ID: ${userId} (skipped - not Novice-or-below and missing elevated role)`);
-    return;
-  }
-
-  // Novice activity filter: skip novices who don't meet activity requirements (no bypass)
-  if (member && message.guild && isNoviceExcludingVerified(member, message.guild)) {
-    if (!meetsNoviceActivityRequirements(userIdStr)) {
-      const timestamps = userActivity.get(userIdStr) || [];
-      const now = Date.now();
-      const in2w = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
-      console.log(`User ID: ${userId} (skipped - novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
+  // Tiered gate (Super Active+ block; Regular+ must be quiet). Below-regular and verified/nitro
+  // pass here — RAP/value is checked after resolution, and the scam/api history exclusion runs then too.
+  if (member && message.guild) {
+    const preSkip = preValueSkipReason(member, message.guild, userIdStr);
+    if (preSkip) {
+      console.log(`User ID: ${userId} (skipped - ${preSkip})`);
       return;
     }
-  }
-
-  // Higher-than-regular roles must be relatively quiet (<= N msgs in the window).
-  if (member && message.guild && !passesHigherRoleActivityFilter(member, message.guild, userIdStr)) {
-    const count = messagesInWindow(userIdStr, HIGHER_ROLE_WINDOW_MS);
-    console.log(
-      `User ID: ${userId} (skipped - above '${REGULAR_ROLE_NAME}' role with ${count} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d > ${HIGHER_ROLE_MAX_MESSAGES})`
-    );
-    return;
   }
 
   console.log("User ID:", userId);
