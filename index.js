@@ -364,9 +364,27 @@ const ELEVATED_TRACKED_ROLE_NAMES = [
   "nitro booster",
 ];
 
+// Activity roles above Active — never log, no matter the inactivity (unless verified/nitro)
+const BLOCKED_ACTIVITY_ROLE_NAMES = [
+  "super active",
+  "no life",
+  "tryhard",
+  "madlad",
+  "insomniac",
+];
+
 function memberHasElevatedTrackedRole(member, guild) {
   if (!member || !guild) return false;
   for (const name of ELEVATED_TRACKED_ROLE_NAMES) {
+    const r = guild.roles?.cache?.find((role) => role.name.toLowerCase() === name);
+    if (r && member.roles?.cache?.has(r.id)) return true;
+  }
+  return false;
+}
+
+function memberHasBlockedActivityRole(member, guild) {
+  if (!member || !guild) return false;
+  for (const name of BLOCKED_ACTIVITY_ROLE_NAMES) {
     const r = guild.roles?.cache?.find((role) => role.name.toLowerCase() === name);
     if (r && member.roles?.cache?.has(r.id)) return true;
   }
@@ -740,6 +758,41 @@ async function fetchRobloxRAP(robloxUserId) {
   }
 }
 
+/** Rolimons player value (limited items). Returns null if unavailable / private. */
+async function fetchRolimonsValue(robloxUserId) {
+  const endpoints = [
+    `https://api.rolimons.com/players/v1/playerinfo/${robloxUserId}`,
+    `https://www.rolimons.com/playerapi/player/${robloxUserId}`,
+  ];
+  const headers = {
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+  };
+
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, { headers });
+      if (!res.ok) continue;
+      const json = await res.json();
+      if (json.success === false) continue;
+      const value = json.value != null ? Number(json.value) : NaN;
+      if (!Number.isNaN(value) && value > 0) {
+        console.log(`  → Rolimons value: ${value.toLocaleString()}`);
+        return value;
+      }
+      // 0 can mean empty/private inventory on Rolimons
+      if (json.value === 0) {
+        console.log(`  → Rolimons value: 0`);
+        return 0;
+      }
+    } catch (e) {
+      console.error(`  → Rolimons value fetch error (${url}):`, e.message);
+    }
+  }
+  console.log(`  → Rolimons value unavailable`);
+  return null;
+}
+
 async function fetchRobloxHeadshotUrl(robloxUserId) {
   try {
     const url =
@@ -775,6 +828,7 @@ async function sendWebhook(data) {
     discordUser,
     discordUserId,
     rap,
+    value,
     message,
     channelId,
     messageId,
@@ -785,6 +839,7 @@ async function sendWebhook(data) {
 
   const cleanDiscordUser = discordUser ? discordUser.replace(/#0$/, "") : "Unknown";
   const rapDisplay = rap != null ? rap.toLocaleString() : "N/A";
+  const valueDisplay = value != null ? value.toLocaleString() : "N/A";
   const rolimonsUrl = robloxUserId
     ? `https://www.rolimons.com/player/${robloxUserId}`
     : null;
@@ -803,7 +858,7 @@ async function sendWebhook(data) {
 
   const embed = {
     description:
-      `**${cleanDiscordUser}** • RAP: **${rapDisplay}**\n` +
+      `**${cleanDiscordUser}** • RAP: **${rapDisplay}** • Value: **${valueDisplay}**\n` +
       `${snippet}\n\n` +
       linksLine,
     color: 0x00ff00,
@@ -831,8 +886,10 @@ async function sendWebhook(data) {
 
 function isVerifiedOrNoviceOrLower(member, guild) {
   if (!member || !guild) return true;
-  // Elevated roles always qualify — often stacked with Member, Trader, etc.
+  // Elevated roles always qualify — verified / nitro are never blocked by activity tier
   if (memberHasElevatedTrackedRole(member, guild)) return true;
+  // Hard block: Super Active and above never qualify (unless verified/nitro above)
+  if (memberHasBlockedActivityRole(member, guild)) return false;
   const noviceRole = guild.roles?.cache?.find((r) => r.name.toLowerCase() === "novice");
   if (!noviceRole) return true;
   const memberHighest = member.roles?.highest;
@@ -921,12 +978,17 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
   }
 
   let rapNum = null;
+  let valueNum = null;
   let finalRobloxUserId = robloxUserId;
 
   if (robloxUserId) {
     console.log(`  → Roblox ID: ${robloxUserId}, Discord: ${discordUser || discordUserId}`);
-    const { rap } = await fetchRobloxRAP(robloxUserId);
+    const [{ rap }, value] = await Promise.all([
+      fetchRobloxRAP(robloxUserId),
+      fetchRolimonsValue(robloxUserId),
+    ]);
     rapNum = rap != null ? Number(rap) : NaN;
+    valueNum = value;
 
     const hasBypassPhrase = messageHasBypassPhrase(pending.message);
     const hasWL = messageHasWL(pending.message);
@@ -945,10 +1007,11 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     rapNum = Number.isNaN(rapNum) ? null : rapNum;
   } else if (shouldLogWithoutRobloxId()) {
     console.log(
-      `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP: N/A)`
+      `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP/Value: N/A)`
     );
     finalRobloxUserId = null;
     rapNum = null;
+    valueNum = null;
   } else {
     console.log("  → No Roblox User ID found in embed, skipping");
     return;
@@ -963,6 +1026,13 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     const channel = await client.channels.fetch(pending.channelId).catch(() => null);
     const guild = channel?.guild;
     const member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
+    if (
+      memberHasBlockedActivityRole(member, guild) &&
+      !memberHasElevatedTrackedRole(member, guild)
+    ) {
+      console.log(`  → Skipped (activity role above Active)`);
+      return;
+    }
     if (isNoviceExcludingVerified(member, guild)) {
       if (!messageHasNoviceBypassPhrase(pending.message)) {
         if (!meetsNoviceActivityRequirements(discordUserId)) {
@@ -998,6 +1068,7 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     discordUser,
     discordUserId: discordIdStr,
     rap: rapNum,
+    value: valueNum,
     message: pending.message,
     channelId: pending.channelId,
     messageId: pending.messageId,
@@ -1089,12 +1160,17 @@ client.on("messageCreate", async (message) => {
     }
 
     let rapNum = null;
+    let valueNum = null;
     let finalRobloxUserId = robloxUserId;
 
     if (robloxUserId) {
       console.log(`  → Roblox ID: ${robloxUserId}, Discord: ${discordUser || discordUserId}`);
-      const { rap } = await fetchRobloxRAP(robloxUserId);
+      const [{ rap }, value] = await Promise.all([
+        fetchRobloxRAP(robloxUserId),
+        fetchRolimonsValue(robloxUserId),
+      ]);
       rapNum = rap != null ? Number(rap) : NaN;
+      valueNum = value;
 
       const hasBypassPhrase = messageHasBypassPhrase(pending.message);
       const hasWL = messageHasWL(pending.message);
@@ -1113,10 +1189,11 @@ client.on("messageCreate", async (message) => {
       rapNum = Number.isNaN(rapNum) ? null : rapNum;
     } else if (shouldLogWithoutRobloxId()) {
       console.log(
-        `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP: N/A)`
+        `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP/Value: N/A)`
       );
       finalRobloxUserId = null;
       rapNum = null;
+      valueNum = null;
     } else {
       console.log("  → No Roblox User ID found in embed, skipping");
       return;
@@ -1128,12 +1205,19 @@ client.on("messageCreate", async (message) => {
       return;
     }
 
-    // Novice filter: skip novice users who don't meet activity requirements
-    // Bypass if message is about needing trade help (help, support, etc.)
+    // Role filters: hard-block Super Active+ (unless verified/nitro); novice activity rules
+    // Bypass novice rules if message is about needing trade help (help, support, etc.)
     try {
       const channel = await client.channels.fetch(pending.channelId).catch(() => null);
       const guild = channel?.guild;
       const member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
+      if (
+        memberHasBlockedActivityRole(member, guild) &&
+        !memberHasElevatedTrackedRole(member, guild)
+      ) {
+        console.log(`  → Skipped (activity role above Active)`);
+        return;
+      }
       if (isNoviceExcludingVerified(member, guild)) {
         if (!messageHasNoviceBypassPhrase(pending.message)) {
           if (!meetsNoviceActivityRequirements(discordUserId)) {
@@ -1163,6 +1247,7 @@ client.on("messageCreate", async (message) => {
       discordUser,
       discordUserId: discordIdStr,
       rap: rapNum,
+      value: valueNum,
       message: pending.message,
       channelId: pending.channelId,
       messageId: pending.messageId,
