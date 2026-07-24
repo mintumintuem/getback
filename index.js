@@ -557,14 +557,14 @@ function isActivityExempt(member, guild) {
   return highestActivityLadderIndex(member, guild) < REGULAR_LADDER_INDEX;
 }
 
-/** Minimum RAP/value for this member's tier. */
+/** Minimum RAP for this member's tier. */
 function tierMinValue(member, guild) {
   return isActivityExempt(member, guild) ? MIN_RAP : REGULAR_PLUS_MIN_VALUE;
 }
 
-/** Highest of a user's RAP and Rolimons value (0 if both unknown). */
-function qualifyingAmount(rap, value) {
-  return Math.max(Number(rap) || 0, Number(value) || 0);
+/** A user's qualifying RAP (0 if unknown). */
+function qualifyingAmount(rap) {
+  return Number(rap) || 0;
 }
 
 /**
@@ -830,10 +830,10 @@ client.on("ready", () => {
     );
   }
   console.log(
-    `Tier filters: below-'${REGULAR_ROLE_NAME}' (by activity ladder; verified/nitro no longer exempt) → RAP/value >= ${MIN_RAP.toLocaleString()} only`
+    `Tier filters: below-'${REGULAR_ROLE_NAME}' (by activity ladder; verified/nitro no longer exempt) → RAP >= ${MIN_RAP.toLocaleString()} only`
   );
   console.log(
-    `  → '${REGULAR_ROLE_NAME}'+ must have < ${REGULAR_PLUS_MAX_MESSAGES} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d, RAP/value >= ${REGULAR_PLUS_MIN_VALUE.toLocaleString()}, and NO 'scam'/'api' in history; Super Active+ blocked`
+    `  → '${REGULAR_ROLE_NAME}'+ must have < ${REGULAR_PLUS_MAX_MESSAGES} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d, RAP >= ${REGULAR_PLUS_MIN_VALUE.toLocaleString()}, and NO 'scam'/'api' in history; Super Active+ blocked`
   );
   console.log(`Data dir: ${DATA_DIR} (logged users: ${loggedUserData.ids.size}, tracked activity: ${userActivity.size})`);
 });
@@ -982,7 +982,6 @@ async function sendWebhook(data) {
     discordUser,
     discordUserId,
     rap,
-    value,
     message,
     channelId,
     messageId,
@@ -993,7 +992,6 @@ async function sendWebhook(data) {
 
   const cleanDiscordUser = discordUser ? discordUser.replace(/#0$/, "") : "Unknown";
   const rapDisplay = rap != null ? rap.toLocaleString() : "N/A";
-  const valueDisplay = value != null ? value.toLocaleString() : "N/A";
   const rolimonsUrl = robloxUserId
     ? `https://www.rolimons.com/player/${robloxUserId}`
     : null;
@@ -1012,7 +1010,7 @@ async function sendWebhook(data) {
 
   const embed = {
     description:
-      `**${cleanDiscordUser}** • RAP: **${rapDisplay}** • Value: **${valueDisplay}**\n` +
+      `**${cleanDiscordUser}** • RAP: **${rapDisplay}**\n` +
       `${snippet}\n\n` +
       linksLine,
     color: 0x00ff00,
@@ -1151,31 +1149,25 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
   }
 
   let rapNum = null;
-  let valueNum = null;
   let finalRobloxUserId = robloxUserId;
 
   if (robloxUserId) {
     console.log(`  → Roblox ID: ${robloxUserId}, Discord: ${discordUser || discordUserId}`);
-    const [{ rap }, value] = await Promise.all([
-      fetchRobloxRAP(robloxUserId),
-      fetchRolimonsValue(robloxUserId),
-    ]);
+    const { rap } = await fetchRobloxRAP(robloxUserId);
     rapNum = rap != null ? Number(rap) : null;
-    valueNum = value != null ? Number(value) : null;
 
-    const amount = qualifyingAmount(rapNum, valueNum);
+    const amount = qualifyingAmount(rapNum);
     const minValue = tierMinValue(member, guild);
     if (amount < minValue) {
-      console.log(`  → Skipped (RAP/value ${amount.toLocaleString()} < ${minValue.toLocaleString()})`);
+      console.log(`  → Skipped (RAP ${amount.toLocaleString()} < ${minValue.toLocaleString()})`);
       return;
     }
   } else if (shouldLogWithoutRobloxId()) {
     console.log(
-      `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP/Value: N/A)`
+      `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP: N/A)`
     );
     finalRobloxUserId = null;
     rapNum = null;
-    valueNum = null;
   } else {
     console.log("  → No Roblox User ID found in embed, skipping");
     return;
@@ -1201,7 +1193,6 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     discordUser,
     discordUserId: discordIdStr,
     rap: rapNum,
-    value: valueNum,
     message: pending.message,
     channelId: pending.channelId,
     messageId: pending.messageId,
@@ -1312,31 +1303,25 @@ client.on("messageCreate", async (message) => {
     }
 
     let rapNum = null;
-    let valueNum = null;
     let finalRobloxUserId = robloxUserId;
 
     if (robloxUserId) {
       console.log(`  → Roblox ID: ${robloxUserId}, Discord: ${discordUser || discordUserId}`);
-      const [{ rap }, value] = await Promise.all([
-        fetchRobloxRAP(robloxUserId),
-        fetchRolimonsValue(robloxUserId),
-      ]);
+      const { rap } = await fetchRobloxRAP(robloxUserId);
       rapNum = rap != null ? Number(rap) : null;
-      valueNum = value != null ? Number(value) : null;
 
-      const amount = qualifyingAmount(rapNum, valueNum);
+      const amount = qualifyingAmount(rapNum);
       const minValue = tierMinValue(member, guild);
       if (amount < minValue) {
-        console.log(`  → Skipped (RAP/value ${amount.toLocaleString()} < ${minValue.toLocaleString()})`);
+        console.log(`  → Skipped (RAP ${amount.toLocaleString()} < ${minValue.toLocaleString()})`);
         return;
       }
     } else if (shouldLogWithoutRobloxId()) {
       console.log(
-        `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP/Value: N/A)`
+        `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP: N/A)`
       );
       finalRobloxUserId = null;
       rapNum = null;
-      valueNum = null;
     } else {
       console.log("  → No Roblox User ID found in embed, skipping");
       return;
@@ -1364,7 +1349,6 @@ client.on("messageCreate", async (message) => {
       discordUser,
       discordUserId: discordIdStr,
       rap: rapNum,
-      value: valueNum,
       message: pending.message,
       channelId: pending.channelId,
       messageId: pending.messageId,
