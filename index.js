@@ -426,6 +426,44 @@ async function userSaidBannedKeywordInHistory(channel, discordUserId) {
   return false;
 }
 
+const DISCORD_EPOCH_MS = 1420070400000;
+const MSG_COUNT_CACHE_TTL_MS = 10 * 60 * 1000; // Avoid re-searching a chatty user on every message
+const msgCountCache = new Map(); // userId -> { count, ts }
+
+/** Snowflake for `ms` ago, usable as a search min_id/max_id bound. */
+function snowflakeForMsAgo(ms) {
+  const ts = Math.max(0, Date.now() - ms - DISCORD_EPOCH_MS);
+  return (BigInt(ts) << 22n).toString();
+}
+
+/**
+ * LIVE count of how many messages a user has sent in the guild within the trailing
+ * window, via Discord's (guild-wide) search — not just messages the bot observed.
+ * Cached briefly to avoid duplicate searches within a single check flow / for chatty
+ * users. Falls back to the observed count if search is unavailable or errors.
+ */
+async function countUserMessagesInWindow(channel, userId, windowMs) {
+  const key = String(userId);
+  const cached = msgCountCache.get(key);
+  if (cached && Date.now() - cached.ts < MSG_COUNT_CACHE_TTL_MS) return cached.count;
+
+  let count;
+  if (channel?.messages?.search) {
+    try {
+      const minId = snowflakeForMsAgo(windowMs);
+      const res = await channel.messages.search({ authors: [key], minId, limit: 1 });
+      count = typeof res?.total === "number" ? res.total : messagesInWindow(userId, windowMs);
+    } catch (e) {
+      console.error(`  → Message-count search error for ${userId}:`, e.message);
+      count = messagesInWindow(userId, windowMs);
+    }
+  } else {
+    count = messagesInWindow(userId, windowMs);
+  }
+  msgCountCache.set(key, { count, ts: Date.now() });
+  return count;
+}
+
 // Roles that always qualify (even above Novice) and skip novice activity rules — match server role names (case-insensitive)
 const ELEVATED_TRACKED_ROLE_NAMES = [
   "rover verified",
@@ -568,20 +606,20 @@ function qualifyingAmount(rap) {
 }
 
 /**
- * Role/activity gate that does NOT need RAP/value or network calls.
- * Returns a human-readable skip reason, or null if the user passes this stage.
+ * Role/activity gate. Returns a human-readable skip reason, or null if the user passes.
  * Tier is based purely on the highest activity-ladder role (Verified/Nitro grant no exemption):
- *  - Super Active and above: always skipped.
- *  - Below Regular (Novice / no activity role): always pass (RAP/value gate handled separately).
- *  - Regular and above: must be quiet (< REGULAR_PLUS_MAX_MESSAGES in the window).
- * (The "scam"/"api" history exclusion runs later, only after RAP/value passes.)
+ *  - Super Active and above: always skipped (cheap, no network).
+ *  - Below Regular (Novice / no activity role): always pass (RAP gate handled separately).
+ *  - Regular and above: must be quiet — checked via a LIVE Discord history search of their
+ *    message count in the window (not just messages the bot recently observed).
+ * (The "scam"/"api" history exclusion runs later, only after RAP passes.)
  */
-function preValueSkipReason(member, guild, userId) {
+async function preValueSkipReason(member, guild, userId, channel) {
   if (memberIsBlockedActivity(member, guild)) {
     return "activity role Super Active or above";
   }
   if (isActivityExempt(member, guild)) return null;
-  const msgCount = messagesInWindow(userId, HIGHER_ROLE_WINDOW_MS);
+  const msgCount = await countUserMessagesInWindow(channel, userId, HIGHER_ROLE_WINDOW_MS);
   if (msgCount >= REGULAR_PLUS_MAX_MESSAGES) {
     return `regular+ with ${msgCount} msgs in ${HIGHER_ROLE_WINDOW_DAYS}d (>= ${REGULAR_PLUS_MAX_MESSAGES})`;
   }
@@ -1141,8 +1179,8 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     console.error("  → Member fetch error:", e.message);
   }
 
-  // Role / activity gate (independent of RAP/value).
-  const preSkip = preValueSkipReason(member, guild, discordUserId);
+  // Role / activity gate (Regular+ msg count via live history search).
+  const preSkip = await preValueSkipReason(member, guild, discordUserId, channel);
   if (preSkip) {
     console.log(`  → Skipped (${preSkip})`);
     return;
@@ -1295,8 +1333,8 @@ client.on("messageCreate", async (message) => {
       console.error("  → Member fetch error:", e.message);
     }
 
-    // Role / activity gate (independent of RAP/value).
-    const preSkip = preValueSkipReason(member, guild, discordUserId);
+    // Role / activity gate (Regular+ msg count via live history search).
+    const preSkip = await preValueSkipReason(member, guild, discordUserId, channel);
     if (preSkip) {
       console.log(`  → Skipped (${preSkip})`);
       return;
@@ -1382,10 +1420,11 @@ client.on("messageCreate", async (message) => {
   }
 
   const member = message.member ?? (await message.guild?.members?.fetch(userId).catch(() => null));
-  // Tiered gate (Super Active+ block; Regular+ must be quiet). Below-regular and verified/nitro
-  // pass here — RAP/value is checked after resolution, and the scam/api history exclusion runs then too.
+  // Tiered gate (Super Active+ block; Regular+ must be quiet via live history search).
+  // Below-regular and verified/nitro pass here — RAP is checked after resolution, and the
+  // scam/api history exclusion runs then too.
   if (member && message.guild) {
-    const preSkip = preValueSkipReason(member, message.guild, userIdStr);
+    const preSkip = await preValueSkipReason(member, message.guild, userIdStr, message.channel);
     if (preSkip) {
       console.log(`User ID: ${userId} (skipped - ${preSkip})`);
       return;
