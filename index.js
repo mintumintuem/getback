@@ -769,6 +769,29 @@ function escapeForDiscordItalics(text) {
     .replace(/_/g, "\\_");
 }
 
+// Fast-claim cache: when a user is logged, remember them so pressing "c" can send
+// to the group chat without re-fetching claim-channel history.
+let lastLoggedUser = null; // { display, clean, at }
+let targetGroupChatCache = null;
+
+async function getTargetGroupChat() {
+  if (!targetGroupChatId) return null;
+  if (targetGroupChatCache) return targetGroupChatCache;
+  targetGroupChatCache = await client2.channels.fetch(targetGroupChatId).catch(() => null);
+  return targetGroupChatCache;
+}
+
+/** Send a claimed Discord username to the group chat ASAP. Returns true if sent. */
+async function sendClaimToGroupChat(discordUser) {
+  const target = await getTargetGroupChat();
+  if (!target) {
+    targetGroupChatCache = null;
+    return false;
+  }
+  await target.send(discordUser);
+  return true;
+}
+
 async function sendWebhook(data) {
   const {
     robloxUserId,
@@ -820,6 +843,16 @@ async function sendWebhook(data) {
     if (res.ok || res.status === 204) {
       const cleanName = normalizeUsername(discordUser);
       saveLoggedUser(discordUserId, cleanName || undefined);
+      // Warm the claim cache so "c" can fire without scanning channel history.
+      if (cleanDiscordUser && cleanDiscordUser !== "Unknown") {
+        lastLoggedUser = {
+          display: cleanDiscordUser,
+          clean: cleanName || normalizeUsername(cleanDiscordUser),
+          at: Date.now(),
+        };
+      }
+      // Prefetch group chat so the next "c" doesn't wait on channel.fetch.
+      getTargetGroupChat().catch(() => {});
       console.log("  → Webhook sent");
     } else {
       console.error("  → Webhook failed:", res.status);
@@ -1324,34 +1357,69 @@ client.on("messageCreate", async (message) => {
 });
 
 
-// Client2: monitors claim channel, sends username to group chat when "c" is sent (manual claim)
+// Prefetch group chat on login so the first "c" is as fast as possible.
+client2.on("ready", () => {
+  getTargetGroupChat()
+    .then((ch) => {
+      if (ch) console.log(`[C] Group chat cached (${targetGroupChatId})`);
+      else console.warn(`[C] Could not cache group chat ${targetGroupChatId}`);
+    })
+    .catch(() => {});
+});
+
+// Client2: monitors claim channel, sends username to group chat when "c" is sent (manual claim).
+// Fast path: use the in-memory last-logged user (set when webhook succeeds) + cached group chat,
+// so we skip channel history fetch / channel.fetch and send first; persist claimed after.
 client2.on("messageCreate", async (message) => {
   const channelId = message.channel?.id;
   const content = (message.content || "").trim().toLowerCase();
 
   if (channelId !== claimChannelId || !/^c\s*$/i.test(content)) return;
   try {
-    const msgs = await message.channel.messages.fetch({ limit: 20 }).catch(() => null);
-    let sourceMsg = null;
-    for (const [, m] of msgs || []) {
-      if (m.id === message.id) continue;
-      if (m.embeds?.length) {
-        const emb = m.embeds[0];
-        if (emb.description?.match(/\*\*[^*]+\*\*/) || emb.title || emb.fields?.some((f) => (f.name || "").toLowerCase().includes("discord"))) {
-          sourceMsg = m;
-          break;
+    let discordUser = null;
+    let cleanName = null;
+
+    // Fast path: most recently logged user (within 10 minutes).
+    if (lastLoggedUser && Date.now() - lastLoggedUser.at < 10 * 60 * 1000) {
+      discordUser = lastLoggedUser.display;
+      cleanName = lastLoggedUser.clean;
+    }
+
+    // Fallback: scan recent claim-channel embeds (slower — network round trip).
+    if (!discordUser) {
+      const msgs = await message.channel.messages.fetch({ limit: 20 }).catch(() => null);
+      let sourceMsg = null;
+      for (const [, m] of msgs || []) {
+        if (m.id === message.id) continue;
+        if (m.embeds?.length) {
+          const emb = m.embeds[0];
+          if (
+            emb.description?.match(/\*\*[^*]+\*\*/) ||
+            emb.title ||
+            emb.fields?.some((f) => (f.name || "").toLowerCase().includes("discord"))
+          ) {
+            sourceMsg = m;
+            break;
+          }
         }
       }
+      if (!sourceMsg) return;
+      const emb = sourceMsg.embeds[0];
+      const match = emb.description?.match(/\*\*([^*]+)\*\*/);
+      if (match) discordUser = match[1];
+      else if (emb.title) discordUser = emb.title;
+      else {
+        for (const f of emb.fields || []) {
+          if ((f.name || "").toLowerCase().includes("discord")) {
+            discordUser = f.value?.trim();
+            break;
+          }
+        }
+      }
+      if (!discordUser) return;
+      cleanName = normalizeUsername(discordUser);
     }
-    if (!sourceMsg) return;
-    let discordUser = null;
-    const emb = sourceMsg.embeds[0];
-    const match = emb.description?.match(/\*\*([^*]+)\*\*/);
-    if (match) discordUser = match[1];
-    else if (emb.title) discordUser = emb.title;
-    else for (const f of emb.fields || []) { if ((f.name || "").toLowerCase().includes("discord")) { discordUser = f.value?.trim(); break; } }
-    if (!discordUser) return;
-    const cleanName = normalizeUsername(discordUser);
+
     if (loggedUserData.claimed.has(cleanName)) {
       console.log(`[C] Skipped "${discordUser}" - already claimed`);
       return;
@@ -1361,11 +1429,36 @@ client2.on("messageCreate", async (message) => {
       console.log(`[C] Skipped "${discordUser}" - not in our logged users (wrong embed or not qualified)`);
       return;
     }
+
+    // Mark claimed in memory first so a double-tap "c" can't double-send, then SEND ASAP.
     loggedUserData.claimed.add(cleanName);
-    fs.writeFileSync(LOGGED_USERS_FILE, JSON.stringify({ ids: [...loggedUserData.ids], usernames: [...loggedUserData.usernames], claimed: [...loggedUserData.claimed] }));
-    const targetChannel = await client2.channels.fetch(targetGroupChatId).catch(() => null);
-    if (targetChannel) { await targetChannel.send(discordUser); console.log(`[C] Sent "${discordUser}" to group chat`); }
-  } catch (e) { console.error(`[C] Error:`, e.message); }
+    if (lastLoggedUser?.clean === cleanName) lastLoggedUser = null;
+
+    const sent = await sendClaimToGroupChat(discordUser);
+    if (sent) {
+      console.log(`[C] Sent "${discordUser}" to group chat`);
+    } else {
+      console.error(`[C] Failed to send "${discordUser}" — group chat unavailable`);
+      loggedUserData.claimed.delete(cleanName); // allow retry
+      return;
+    }
+
+    // Persist claimed list after the send so disk I/O never delays the group-chat message.
+    try {
+      fs.writeFileSync(
+        LOGGED_USERS_FILE,
+        JSON.stringify({
+          ids: [...loggedUserData.ids],
+          usernames: [...loggedUserData.usernames],
+          claimed: [...loggedUserData.claimed],
+        })
+      );
+    } catch (e) {
+      console.error(`[C] Failed to persist claimed:`, e.message);
+    }
+  } catch (e) {
+    console.error(`[C] Error:`, e.message);
+  }
 });
 
 // Diagnostic: see if Bloxlink edits its deferred reply (messageUpdate) in the verify channel
