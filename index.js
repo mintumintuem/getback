@@ -812,12 +812,14 @@ async function sendWebhook(data) {
     ? `https://www.rolimons.com/player/${robloxUserId}`
     : null;
 
-  let thumb = null;
-  if (robloxUserId) {
-    thumb = await fetchRobloxHeadshotUrl(robloxUserId);
-  }
-  if (!thumb && avatarUrl) thumb = avatarUrl;
-  if (!thumb) thumb = "https://via.placeholder.com/150";
+  // Don't wait on the thumbnails API — it adds ~200–800ms before the log appears.
+  // Prefer Discord avatar, else Roblox's direct headshot URL (no extra round-trip).
+  let thumb =
+    avatarUrl ||
+    (robloxUserId
+      ? `https://www.roblox.com/headshot-thumbnail/image?userId=${encodeURIComponent(robloxUserId)}&width=150&height=150&format=png`
+      : null) ||
+    "https://via.placeholder.com/150";
 
   const snippet = message?.trim() ? `*${escapeForDiscordItalics(message)}*` : "*(no message)*";
   const linksLine = rolimonsUrl
@@ -935,8 +937,37 @@ async function processVerificationResult(embed, discordUserId, pending) {
   });
 }
 
-/** Apply RAP/activity/novice filters to a resolved (discord→roblox) result and send the webhook. */
-async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId, pending, avatarUrl, isNotLinked }) {
+/** Resolve guild member for role filters, preferring cache / prefetched member (no channel.fetch). */
+async function resolveMemberForChecks(discordUserId, pending, prefetchedMember, prefetchedGuild) {
+  if (prefetchedMember && prefetchedGuild) {
+    return { member: prefetchedMember, guild: prefetchedGuild };
+  }
+  // Prefer guild cache (no channel.fetch round-trip).
+  let guild = prefetchedGuild || null;
+  if (!guild && pending?.guildId) {
+    guild = client.guilds.cache.get(String(pending.guildId)) || null;
+  }
+  if (!guild && pending?.channelId) {
+    const channel = await client.channels.fetch(pending.channelId).catch(() => null);
+    guild = channel?.guild || null;
+  }
+  if (!guild) return { member: prefetchedMember || null, guild: null };
+  const member =
+    prefetchedMember ||
+    (await guild.members.fetch(discordUserId).catch(() => null));
+  return { member, guild };
+}
+
+async function finalizeAndSendWebhook({
+  robloxUserId,
+  discordUser,
+  discordUserId,
+  pending,
+  avatarUrl,
+  isNotLinked,
+  member: prefetchedMember = null,
+  guild: prefetchedGuild = null,
+}) {
   if (!pending) return;
 
   const discordIdStr = String(discordUserId);
@@ -953,12 +984,28 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     return isNotLinked || !!discordUser;
   }
 
+  // Cheap local filters first (no network).
+  if (isTooActive(discordUserId)) {
+    console.log(`  → Skipped (too active in Rolimons)`);
+    return;
+  }
+
   let rapNum = null;
   let finalRobloxUserId = robloxUserId;
+  let member = prefetchedMember;
+  let guild = prefetchedGuild;
+
+  // Run RAP fetch + member resolve in parallel — largest latency win after headshot removal.
+  const memberPromise = resolveMemberForChecks(discordUserId, pending, prefetchedMember, prefetchedGuild);
+  const rapPromise = robloxUserId
+    ? fetchRobloxRAP(robloxUserId)
+    : Promise.resolve({ rap: null });
 
   if (robloxUserId) {
     console.log(`  → Roblox ID: ${robloxUserId}, Discord: ${discordUser || discordUserId}`);
-    const { rap } = await fetchRobloxRAP(robloxUserId);
+    const [{ rap }, resolved] = await Promise.all([rapPromise, memberPromise]);
+    member = resolved.member;
+    guild = resolved.guild;
     rapNum = rap != null ? Number(rap) : NaN;
 
     const hasBypassPhrase = messageHasBypassPhrase(pending.message);
@@ -982,20 +1029,15 @@ async function finalizeAndSendWebhook({ robloxUserId, discordUser, discordUserId
     );
     finalRobloxUserId = null;
     rapNum = null;
+    const resolved = await memberPromise;
+    member = resolved.member;
+    guild = resolved.guild;
   } else {
     console.log("  → No Roblox User ID found in embed, skipping");
     return;
   }
 
-  if (isTooActive(discordUserId)) {
-    console.log(`  → Skipped (too active in Rolimons)`);
-    return;
-  }
-
   try {
-    const channel = await client.channels.fetch(pending.channelId).catch(() => null);
-    const guild = channel?.guild;
-    const member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
     if (isNoviceExcludingVerified(member, guild)) {
       if (!messageHasNoviceBypassPhrase(pending.message)) {
         if (!meetsNoviceActivityRequirements(discordUserId)) {
@@ -1109,98 +1151,16 @@ client.on("messageCreate", async (message) => {
 
     // Try to get avatar from embed thumbnail or image
     const avatarUrl = embed.thumbnail?.url || embed.image?.url;
-
     const isNotLinked = isUnlinkedVerificationEmbed(embed);
 
-    /** Embed has no Roblox user id — still log Discord user when clearly unlinked / we have a display name */
-    function shouldLogWithoutRobloxId() {
-      if (!LOG_UNLINKED) return false;
-      if (robloxUserId || !cleanUsername) return false;
-      const t = (discordUser || "").trim().toLowerCase();
-      if (["error", "oops", "failed", "invalid", "warning"].includes(t)) return false;
-      return isNotLinked || !!discordUser;
-    }
-
-    let rapNum = null;
-    let finalRobloxUserId = robloxUserId;
-
-    if (robloxUserId) {
-      console.log(`  → Roblox ID: ${robloxUserId}, Discord: ${discordUser || discordUserId}`);
-      const { rap } = await fetchRobloxRAP(robloxUserId);
-      rapNum = rap != null ? Number(rap) : NaN;
-
-      const hasBypassPhrase = messageHasBypassPhrase(pending.message);
-      const hasWL = messageHasWL(pending.message);
-
-      if (hasWL) {
-        if (!Number.isNaN(rapNum) && rapNum < MIN_RAP_WL) {
-          console.log(`  → Skipped (w/l: RAP ${rapNum.toLocaleString()} < ${MIN_RAP_WL.toLocaleString()})`);
-          return;
-        }
-      } else if (!hasBypassPhrase) {
-        if (Number.isNaN(rapNum) || rapNum < MIN_RAP) {
-          console.log(`  → Skipped (RAP ${rap ?? "N/A"} < ${MIN_RAP.toLocaleString()})`);
-          return;
-        }
-      }
-      rapNum = Number.isNaN(rapNum) ? null : rapNum;
-    } else if (shouldLogWithoutRobloxId()) {
-      console.log(
-        `  → ${verifyBot}: no Roblox link for ${discordUser || discordUserId} (${isNotLinked ? "unlinked / not verified" : "no ID in embed"}), logging anyway (RAP: N/A)`
-      );
-      finalRobloxUserId = null;
-      rapNum = null;
-    } else {
-      console.log("  → No Roblox User ID found in embed, skipping");
-      return;
-    }
-
-    // Skip if user is too active (multiple msgs/min or talked multiple times in 10 days)
-    if (isTooActive(discordUserId)) {
-      console.log(`  → Skipped (too active in Rolimons)`);
-      return;
-    }
-
-    // Novice filter: skip novice users who don't meet activity requirements
-    // Bypass if message is about needing trade help (help, support, etc.)
-    try {
-      const channel = await client.channels.fetch(pending.channelId).catch(() => null);
-      const guild = channel?.guild;
-      const member = guild ? await guild.members.fetch(discordUserId).catch(() => null) : null;
-      if (isNoviceExcludingVerified(member, guild)) {
-        if (!messageHasNoviceBypassPhrase(pending.message)) {
-          if (!meetsNoviceActivityRequirements(discordUserId)) {
-            const timestamps = userActivity.get(discordUserId) || [];
-            const now = Date.now();
-            const in2w = timestamps.filter((t) => now - t <= TWO_WEEKS_MS).length;
-            console.log(`  → Skipped (novice doesn't meet activity: ${timestamps.length} total msgs, ${in2w} in past 2w)`);
-            return;
-          }
-        }
-      }
-    } catch (e) {
-      console.error("  → Novice check error:", e.message);
-    }
-
-    // Debounce: prevent duplicate webhooks for same user (set before async sendWebhook)
-    const now = Date.now();
-    if (recentWebhooks.has(discordIdStr) && now - recentWebhooks.get(discordIdStr) < WEBHOOK_DEBOUNCE_MS) {
-      console.log(`  → Skipped (duplicate, sent for ${discordUser} recently)`);
-      return;
-    }
-    recentWebhooks.set(discordIdStr, now);
-
-    // Send webhook
-    await sendWebhook({
-      robloxUserId: finalRobloxUserId,
+    // Shared fast path (parallel RAP + member, no headshot wait).
+    await finalizeAndSendWebhook({
+      robloxUserId,
       discordUser,
-      discordUserId: discordIdStr,
-      rap: rapNum,
-      message: pending.message,
-      channelId: pending.channelId,
-      messageId: pending.messageId,
-      guildId: pending.guildId,
+      discordUserId,
+      pending,
       avatarUrl,
+      isNotLinked,
     });
     return;
   }
@@ -1269,6 +1229,9 @@ client.on("messageCreate", async (message) => {
   if (BLOXLINK_API_KEY) {
     try {
       const pending = pendingChecks.get(userIdStr);
+      // Pass the already-resolved member so finalize skips another members.fetch.
+      const discordAvatar =
+        message.author?.displayAvatarURL?.({ size: 128, extension: "png" }) || null;
       const result = await bloxlinkDiscordToRoblox(userId);
       if (!result.ok) {
         console.log(`  → Bloxlink API lookup failed for ${userId} (will retry on next message)`);
@@ -1283,8 +1246,10 @@ client.on("messageCreate", async (message) => {
           discordUser,
           discordUserId: userId,
           pending,
-          avatarUrl: null,
+          avatarUrl: discordAvatar,
           isNotLinked: !!result.notLinked,
+          member,
+          guild: message.guild || null,
         });
       }
     } catch (e) {
@@ -1333,8 +1298,13 @@ client.on("messageCreate", async (message) => {
         discordUser: pending.discordUsername || pending.displayName || String(userId),
         discordUserId: userId,
         pending,
-        avatarUrl: info.avatarUrl || null,
+        avatarUrl:
+          info.avatarUrl ||
+          message.author?.displayAvatarURL?.({ size: 128, extension: "png" }) ||
+          null,
         isNotLinked: !info.robloxId,
+        member,
+        guild: message.guild || null,
       });
     } else if (embeds && embeds.length && pending) {
       // Legacy embed path (kept as a fallback if Bloxlink ever reverts).
