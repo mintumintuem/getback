@@ -71,6 +71,25 @@ function saveLoggedUser(userId, username) {
   }
 }
 
+/** Update in-memory logged sets immediately; persist to disk on next tick. */
+function markLoggedUser(userId, username) {
+  loggedUserData.ids.add(userId);
+  checkedUsers.add(userId);
+  const normalized = username ? normalizeUsername(username) : "";
+  if (normalized) loggedUserData.usernames.add(normalized);
+  setImmediate(() => {
+    try {
+      fs.writeFileSync(LOGGED_USERS_FILE, JSON.stringify({
+        ids: [...loggedUserData.ids],
+        usernames: [...loggedUserData.usernames],
+        claimed: [...loggedUserData.claimed],
+      }));
+    } catch (e) {
+      console.error("  → Failed to persist logged user:", e.message);
+    }
+  });
+}
+
 let activityDirty = false;
 
 function loadUserActivity() {
@@ -150,6 +169,10 @@ const BLOXLINK_GUILD_ID = parseId(getEnv("BLOXLINK_GUILD_ID"));
 // When false (default), only users with a resolved Roblox account that pass the RAP
 // filter get a webhook. Set LOG_UNLINKED=true to also post "RAP: N/A" for unlinked users.
 const LOG_UNLINKED = getEnv("LOG_UNLINKED", "false").toLowerCase() === "true";
+
+// Cache Discord→Roblox lookups so repeat posters don't pay Bloxlink latency again.
+const BLOXLINK_CACHE_TTL_MS = 60 * 60 * 1000;
+const bloxlinkCache = new Map(); // discordUserId -> { result, at }
 
 const VERIFY_SLASH_MAX_RETRIES = Math.min(
   12,
@@ -248,6 +271,11 @@ function parseBloxlinkResolve(data) {
  */
 async function bloxlinkDiscordToRoblox(discordUserId) {
   if (!BLOXLINK_API_KEY) return { ok: false };
+  const cacheKey = String(discordUserId);
+  const cached = bloxlinkCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < BLOXLINK_CACHE_TTL_MS) {
+    return { ...cached.result, cached: true };
+  }
   // A server (guild) API key only works against its own guild. Never use the
   // monitored message's guild here — that would be the Rolimons guild, which the
   // key isn't bound to. Use the configured guild, or the global endpoint.
@@ -256,16 +284,21 @@ async function bloxlinkDiscordToRoblox(discordUserId) {
   const url = gid
     ? `${base}/guilds/${gid}/discord-to-roblox/${discordUserId}`
     : `${base}/discord-to-roblox/${discordUserId}`;
+  const t0 = Date.now();
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const res = await fetch(url, { headers: { Authorization: BLOXLINK_API_KEY } });
-      if (res.status === 404) return { ok: true, notLinked: true };
+      if (res.status === 404) {
+        const result = { ok: true, notLinked: true };
+        bloxlinkCache.set(cacheKey, { result, at: Date.now() });
+        return result;
+      }
       if (res.status === 429 || res.status === 503 || res.status === 502) {
         if (attempt < 3) {
-          await sleep(1500 * attempt);
+          await sleep(400 * attempt); // shorter backoff — claim races can't wait 1.5s+
           continue;
         }
-        console.warn(`  → Bloxlink API ${res.status} (giving up) for ${discordUserId}`);
+        console.warn(`  → Bloxlink API ${res.status} (giving up) for ${discordUserId} (${Date.now() - t0}ms)`);
         return { ok: false };
       }
       if (!res.ok) {
@@ -274,16 +307,21 @@ async function bloxlinkDiscordToRoblox(discordUserId) {
         return { ok: false };
       }
       const data = await res.json().catch(() => null);
-      console.log(`  → [bloxlink raw] ${discordUserId}: ${JSON.stringify(data).slice(0, 400)}`);
       // Bloxlink sometimes returns 200 with { error: "...not linked..." }
-      if (data && data.error && !data.robloxID) return { ok: true, notLinked: true };
-      return parseBloxlinkResolve(data);
+      let result;
+      if (data && data.error && !data.robloxID) result = { ok: true, notLinked: true };
+      else result = parseBloxlinkResolve(data);
+      bloxlinkCache.set(cacheKey, { result, at: Date.now() });
+      console.log(
+        `  → [bloxlink] ${discordUserId} → ${result.robloxId || "none"}${result.notLinked ? " (not linked)" : ""} (${Date.now() - t0}ms)`
+      );
+      return result;
     } catch (e) {
       if (attempt < 3) {
-        await sleep(1500 * attempt);
+        await sleep(400 * attempt);
         continue;
       }
-      console.warn(`  → Bloxlink API error for ${discordUserId}: ${e.message}`);
+      console.warn(`  → Bloxlink API error for ${discordUserId}: ${e.message} (${Date.now() - t0}ms)`);
       return { ok: false };
     }
   }
@@ -678,64 +716,74 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
   });
 }
 
-async function fetchRobloxRAP(robloxUserId) {
+/**
+ * Sum RAP from Roblox collectibles inventory.
+ * If `stopAt` is set, stop paginating as soon as totalRAP >= stopAt (enough to pass
+ * the filter). Displayed RAP may then be a lower bound for very large inventories.
+ */
+async function fetchRobloxRAP(robloxUserId, { stopAt = null } = {}) {
+  const t0 = Date.now();
   try {
-    console.log(`  → Fetching inventory for Roblox user ${robloxUserId}...`);
-    
-    // Fetch user's inventory from Roblox API
     const inventoryUrl = `https://inventory.roblox.com/v1/users/${robloxUserId}/assets/collectibles?sortOrder=Asc&limit=100`;
     const res = await fetch(inventoryUrl);
-    
+
     if (!res.ok) {
-      console.log(`  → Roblox API returned status: ${res.status}`);
+      console.log(`  → Roblox API returned status: ${res.status} (${Date.now() - t0}ms)`);
       return { rap: null };
     }
-    
+
     const inventoryData = await res.json();
-    
+
     if (!inventoryData.data || !Array.isArray(inventoryData.data)) {
-      console.log(`  → No inventory data found`);
+      console.log(`  → No inventory data found (${Date.now() - t0}ms)`);
       return { rap: null };
     }
-    
+
     let totalRAP = 0;
     let itemCount = 0;
-    
-    // Calculate total RAP from all collectible items
+    let earlyExit = false;
+
     for (const item of inventoryData.data) {
       if (item.recentAveragePrice != null && item.recentAveragePrice > 0) {
         totalRAP += item.recentAveragePrice;
         itemCount++;
       }
     }
-    
-    // Handle pagination if there are more items
+
     let nextCursor = inventoryData.nextPageCursor;
+    // Stop as soon as we clear the threshold — don't wait on more pages.
     while (nextCursor) {
+      if (stopAt != null && totalRAP >= stopAt) {
+        earlyExit = true;
+        break;
+      }
       const nextUrl = `https://inventory.roblox.com/v1/users/${robloxUserId}/assets/collectibles?sortOrder=Asc&limit=100&cursor=${nextCursor}`;
       const nextRes = await fetch(nextUrl);
-      
+
       if (!nextRes.ok) break;
-      
+
       const nextData = await nextRes.json();
-      
+
       if (!nextData.data) break;
-      
+
       for (const item of nextData.data) {
         if (item.recentAveragePrice != null && item.recentAveragePrice > 0) {
           totalRAP += item.recentAveragePrice;
           itemCount++;
         }
       }
-      
+
       nextCursor = nextData.nextPageCursor;
     }
-    
-    console.log(`  → Found ${itemCount} collectibles with total RAP: ${totalRAP}`);
-    
+    if (stopAt != null && totalRAP >= stopAt && nextCursor) earlyExit = true;
+
+    console.log(
+      `  → RAP ${totalRAP.toLocaleString()} across ${itemCount} items${earlyExit ? " (early exit)" : ""} (${Date.now() - t0}ms)`
+    );
+
     return { rap: totalRAP > 0 ? totalRAP : null };
   } catch (e) {
-    console.error("  → Roblox API error:", e.message);
+    console.error(`  → Roblox API error (${Date.now() - t0}ms):`, e.message);
     return { rap: null };
   }
 }
@@ -844,8 +892,7 @@ async function sendWebhook(data) {
     });
     if (res.ok || res.status === 204) {
       const cleanName = normalizeUsername(discordUser);
-      saveLoggedUser(discordUserId, cleanName || undefined);
-      // Warm the claim cache so "c" can fire without scanning channel history.
+      // Warm claim cache BEFORE anything else so "c" can fire immediately.
       if (cleanDiscordUser && cleanDiscordUser !== "Unknown") {
         lastLoggedUser = {
           display: cleanDiscordUser,
@@ -853,8 +900,8 @@ async function sendWebhook(data) {
           at: Date.now(),
         };
       }
-      // Prefetch group chat so the next "c" doesn't wait on channel.fetch.
       getTargetGroupChat().catch(() => {});
+      markLoggedUser(discordUserId, cleanName || undefined);
       console.log("  → Webhook sent");
     } else {
       console.error("  → Webhook failed:", res.status);
@@ -995,10 +1042,17 @@ async function finalizeAndSendWebhook({
   let member = prefetchedMember;
   let guild = prefetchedGuild;
 
-  // Run RAP fetch + member resolve in parallel — largest latency win after headshot removal.
+  const hasBypassPhrase = messageHasBypassPhrase(pending.message);
+  const hasWL = messageHasWL(pending.message);
+  // Early-exit RAP pagination once the relevant threshold is cleared.
+  const rapStopAt = hasWL ? MIN_RAP_WL : hasBypassPhrase ? null : MIN_RAP;
+  // Bypass-phrase messages don't need RAP to qualify — skip the inventory call entirely.
+  const needRap = !!robloxUserId && (hasWL || !hasBypassPhrase);
+
+  const t0 = Date.now();
   const memberPromise = resolveMemberForChecks(discordUserId, pending, prefetchedMember, prefetchedGuild);
-  const rapPromise = robloxUserId
-    ? fetchRobloxRAP(robloxUserId)
+  const rapPromise = needRap
+    ? fetchRobloxRAP(robloxUserId, { stopAt: rapStopAt })
     : Promise.resolve({ rap: null });
 
   if (robloxUserId) {
@@ -1007,9 +1061,6 @@ async function finalizeAndSendWebhook({
     member = resolved.member;
     guild = resolved.guild;
     rapNum = rap != null ? Number(rap) : NaN;
-
-    const hasBypassPhrase = messageHasBypassPhrase(pending.message);
-    const hasWL = messageHasWL(pending.message);
 
     if (hasWL) {
       if (!Number.isNaN(rapNum) && rapNum < MIN_RAP_WL) {
@@ -1068,6 +1119,7 @@ async function finalizeAndSendWebhook({
   }
   recentWebhooks.set(discordIdStr, now);
 
+  const tWebhook = Date.now();
   await sendWebhook({
     robloxUserId: finalRobloxUserId,
     discordUser,
@@ -1079,6 +1131,7 @@ async function finalizeAndSendWebhook({
     guildId: pending.guildId,
     avatarUrl,
   });
+  console.log(`  → finalize→webhook done in ${Date.now() - t0}ms (webhook ${Date.now() - tWebhook}ms)`);
 }
 
 client.on("messageCreate", async (message) => {
@@ -1238,9 +1291,11 @@ client.on("messageCreate", async (message) => {
         checkedUsers.delete(userIdStr); // allow another attempt later
       } else {
         const discordUser = pending?.discordUsername || pending?.displayName || String(userId);
-        console.log(
-          `  → [bloxlink api] ${userId} → roblox=${result.robloxId || "none"}${result.notLinked ? " (not linked)" : ""}`
-        );
+        if (result.cached) {
+          console.log(
+            `  → [bloxlink cache] ${userId} → roblox=${result.robloxId || "none"}${result.notLinked ? " (not linked)" : ""}`
+          );
+        }
         await finalizeAndSendWebhook({
           robloxUserId: result.robloxId || null,
           discordUser,
